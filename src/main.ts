@@ -32,9 +32,23 @@ $('third-party-notices').textContent = `Sub Extract\n===========\n\n${projectLic
 const video = $<HTMLVideoElement>('video');
 const stage = $('video-stage');
 const cueList = $('cue-list');
+function readSavedRegion(): Region {
+  try {
+    const saved = JSON.parse(localStorage.getItem('sub-extract-region') || 'null') as Region | null;
+    if (saved && [saved.x, saved.y, saved.width, saved.height].every(Number.isFinite)
+      && saved.x >= 0 && saved.x < 1 && saved.y >= 0 && saved.y < 1 && saved.width > 0 && saved.height > 0
+      && saved.x + saved.width <= 1 + 1e-9 && saved.y + saved.height <= 1 + 1e-9) {
+      return { x: saved.x, y: saved.y, width: Math.min(saved.width, 1 - saved.x), height: Math.min(saved.height, 1 - saved.y) };
+    }
+  } catch { /* Missing, invalid, or unavailable storage uses the default region. */ }
+  return { ...DEFAULT_REGION };
+}
+function rememberRegion() {
+  try { localStorage.setItem('sub-extract-region', JSON.stringify(region)); } catch { /* Region editing still works without storage. */ }
+}
 let source: File | undefined;
 let sourceURL: string | undefined;
-let region: Region = { ...DEFAULT_REGION };
+let region: Region = readSavedRegion();
 let engine: OcrEngine | undefined;
 let engineReady = false, engineBackend = '', engineModel = MODEL_NAME;
 let modelMode: 'online' | 'local' | undefined, cachedModels = false;
@@ -161,8 +175,8 @@ window.addEventListener('dragend', clearFileDrag);
 window.addEventListener('blur', clearFileDrag);
 
 $('select-region').onclick = () => { if (!source) return toast('请先选择视频。'); setCropMode(!cropMode); };
-$('reset-region').onclick = () => { region = { ...DEFAULT_REGION }; updateRegion(); setCropMode(false); };
-$('full-region').onclick = () => { region = { x: 0, y: 0, width: 1, height: 1 }; updateRegion(); setCropMode(false); };
+$('reset-region').onclick = () => { region = { ...DEFAULT_REGION }; rememberRegion(); updateRegion(); setCropMode(false); };
+$('full-region').onclick = () => { region = { x: 0, y: 0, width: 1, height: 1 }; rememberRegion(); updateRegion(); setCropMode(false); };
 interface CropDrag { x: number; y: number; old: Region; pointerId: number; mode: 'select' | 'move' | 'resize' | 'center'; corner?: CropCorner; axis?: 'x' | 'y' }
 let drag: CropDrag | undefined, guideTimer = 0;
 const point = (event: PointerEvent) => { const rect = stage.getBoundingClientRect(); return { x: clamp((event.clientX - rect.left) / rect.width, 0, 1), y: clamp((event.clientY - rect.top) / rect.height, 0, 1) }; };
@@ -205,6 +219,7 @@ $('crop-layer').onpointerup = event => {
   if (region.width * video.videoWidth < 16 || region.height * video.videoHeight < 8) { region = drag.old; toast('选取的字幕区域太小，请重新框选。'); }
   drag = undefined; $('crop-layer').releasePointerCapture(event.pointerId); $('crop-layer').classList.remove('dragging');
   $('crop-box').classList.remove('center-resizing');
+  rememberRegion();
   updateRegion(); setCropMode(false); guideTimer = window.setTimeout(() => guides(), 650); $('crop-box').focus({ preventScroll: true });
 };
 const cancelDrag = () => {
@@ -226,6 +241,7 @@ $('crop-box').onkeydown = event => {
   const dx = x * step / video.videoWidth, dy = y * step / video.videoHeight;
   const corner = (event.target as HTMLElement).dataset.corner as CropCorner | undefined;
   region = corner ? resizeRegion(region, corner, dx, dy, 16 / video.videoWidth, 8 / video.videoHeight) : moveRegion(region, dx, dy).region;
+  if (!drag) rememberRegion();
   guides(); updateRegion();
 };
 
@@ -441,7 +457,7 @@ $<HTMLInputElement>('import-json').onchange = async event => {
     if (file.size > 20_000_000) throw new Error('JSON 项目过大。');
     const imported = importProject(JSON.parse(await file.text()));
     if (project?.cues.length && !confirm('导入将替换当前时间轴。继续？')) return;
-    project = imported; region = { ...imported.extraction.region }; updateRegion(); renderCues();
+    project = imported; region = { ...imported.extraction.region }; rememberRegion(); updateRegion(); renderCues();
     if (source && Math.abs(imported.source.duration - video.duration * 1000) > 1000) toast('JSON 项目与当前视频的时长不一致，请确认选择的视频。', true);
     else if (source && source.name !== imported.source.name) toast('JSON 项目视频名与当前视频不同，请确认选择的视频。', true); else toast('已导入字幕时间轴。');
   } catch (error) { toast(message(error), true); }
