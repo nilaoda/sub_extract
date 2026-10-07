@@ -8,7 +8,7 @@
 
 - 本地 MP4 / MOV 视频预览，按指定时间范围提取字幕。
 - 自由框选字幕区域，随时拖动、调整大小，靠近画面中心自动吸附。
-- PP-OCRv4 中英文识别，模型下载校验与浏览器缓存。
+- PP-OCRv5 mobile 检测 + PP-OCRv4 中英文识别，模型下载校验与浏览器缓存。
 - WebGPU 批量加速，保留单张处理选项，兼容模型自动回退。
 - 字幕画面变化检测，相似帧复用 OCR 结果，显示实际识别与复用帧数。
 - 跨帧文本合并、短暂漏字稳定处理及字幕边界精修。
@@ -91,19 +91,21 @@ npx vite .pages --host 127.0.0.1 --port 4174
 
 ## 模型
 
-内置下载来源为固定版本的 PP-OCRv4 模型，总大小约 **15.6 MB**，下载时验证 SHA-256。
+默认组合为 **PP-OCRv5 mobile 检测 + PP-OCRv4 识别**，使用与 v4 识别模型配套的字典。模型来源固定版本，总大小约 **15.7 MB**，下载时验证 SHA-256。检测与识别的版本可以不同，但输入输出格式必须兼容。
+
+已有完整 v4 模型缓存时，应用自动复用识别模型和字典，仅下载新的 v5 mobile 检测模型（约 4.8 MB）。首次升级需要联网；升级完成后，仍可自动加载缓存并离线识别。模型权重来自社区 ONNX 转换，来源和上游许可证见 [第三方声明](THIRD_PARTY_NOTICES.md)。
 
 | 文件 | 下载 |
 | --- | --- |
-| 检测模型 | [ch_PP-OCRv4_det.onnx](https://huggingface.co/OleehyO/paddleocrv4.onnx/resolve/da2c446aa67d75f1d5dac725772e8b68d1b53bf0/ch_PP-OCRv4_det.onnx) |
+| 检测模型 | [PP-OCRv5_mobile_det_infer.onnx](https://huggingface.co/x3zvawq/paddleocr-js-onnx/resolve/51c2133b5a7ea27b795fa8c400fdbfbd5337dd6a/ppocr_v5_mobile/PP-OCRv5_mobile_det_infer.onnx) |
 | 识别模型 | [ch_PP-OCRv4_rec.onnx](https://huggingface.co/OleehyO/paddleocrv4.onnx/resolve/da2c446aa67d75f1d5dac725772e8b68d1b53bf0/ch_PP-OCRv4_rec.onnx) |
 | 字符字典 | [ppocr_keys_v1.txt](https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/8cce9b6fd7ccb50226d0c38f94054d81c29b8184/ppocr/utils/ppocr_keys_v1.txt) |
 
-本地加载支持 **PP-OCRv4 兼容模型**，需要匹配的字典，不能直接替换为任意 ONNX 模型：
+本地加载支持 **PP-OCRv4 / v5 兼容模型**，需要与识别模型匹配的字典，不能直接替换为任意 ONNX 模型：
 
 - 检测输入为 BGR / NCHW，DB 输出为 `[1, 1, H, W]` 概率图。
 - 识别输入为 BGR / NCHW，高度 48、动态宽度，输出为 `[1, T, C]` CTC 概率。
-- 字典使用 UTF-8，每行一个字符，不含 CTC blank；程序添加末尾空格。预设模型输出 6625 类。
+- 字典使用 UTF-8，每行一个字符，不含 CTC blank；程序添加末尾空格。预设 v4 识别模型输出 6625 类；不要给它使用 v5 识别模型的字典。
 - 模型权重需包含在 ONNX 文件中，不支持外部权重文件。
 
 自动模式优先使用 WebGPU，GPU 初始化失败时回退 WASM。部分模型算子可能在 CPU 上执行；WASM 使用单线程，以支持直接打开本地 HTML。

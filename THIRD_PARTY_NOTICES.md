@@ -58,12 +58,23 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Online model references (weights are downloaded separately)
 ---------------------------------------------------------
-PaddleOCR / PP-OCRv4: Apache-2.0
+Upstream PaddleOCR / PP-OCRv4 / PP-OCRv5: Apache-2.0
 https://github.com/PaddlePaddle/PaddleOCR
-ONNX conversions (model card declares Apache-2.0):
+Default detector: PP-OCRv5 mobile, community ONNX conversion from:
+https://huggingface.co/x3zvawq/paddleocr-js-onnx
+Revision: 51c2133b5a7ea27b795fa8c400fdbfbd5337dd6a
+File: ppocr_v5_mobile/PP-OCRv5_mobile_det_infer.onnx
+This is a community conversion, not an official PaddleOCR ONNX release.
+The conversion repository does not explicitly declare a license in its model
+card; the Apache-2.0 reference above identifies the upstream PaddleOCR license.
+
+Default recognizer: PP-OCRv4, community ONNX conversion
+(model card declares Apache-2.0):
 https://huggingface.co/OleehyO/paddleocrv4.onnx
 Revision: da2c446aa67d75f1d5dac725772e8b68d1b53bf0
-Dictionary: PaddleOCR revision 8cce9b6fd7ccb50226d0c38f94054d81c29b8184
+File: ch_PP-OCRv4_rec.onnx
+Dictionary: PP-OCRv4 ppocr_keys_v1.txt, PaddleOCR revision
+8cce9b6fd7ccb50226d0c38f94054d81c29b8184
 
 Runtime packaging modifications: the WASM binary is embedded and supplied to
 ONNX Runtime explicitly. Its unused relative WASM URL fallback is disabled;

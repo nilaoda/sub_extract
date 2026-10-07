@@ -5,7 +5,7 @@ import projectLicense from '../LICENSE?raw';
 import { DEFAULT_REGION, clamp, buildCues, formatTime, parseTime, exportSubtitles, validateCues, importProject, normalizeText, moveRegion, resizeRegion, resizeRegionFromCenter, cropPointerMode, type CropCorner, type Region, type Observation, type Project, type Cue } from './core';
 import { seekPreview, timelineDuration, cuePreviewTarget, timelineCueAt } from './preview';
 import { OcrEngine, type OcrResult, type OcrTextResult, type OcrWindowResult } from './ocr';
-import { MODEL_NAME, MODEL_FILES, downloadModels, localModels, clearModelCache, hasCachedModels, type ModelData } from './models';
+import { MODEL_NAME, MODEL_FILES, downloadModels, localModels, clearModelCache, getModelCacheState, type ModelData, type ModelCacheState } from './models';
 import { readMetadata, sampleVideo, sampleVideoWindows, cropFrame, type VideoMetadata, type SamplingTimings } from './video';
 import { PerformanceTotals } from './performance';
 import { OcrCropQueue, OCR_WINDOW_FRAMES } from './ocr-batch';
@@ -22,7 +22,7 @@ document.querySelector('#app')!.innerHTML = `
 <div class="video-caption"><span id="video-name">尚未选择视频</span><span id="video-info">—</span></div>
 <div class="crop-toolbar"><button id="select-region" class="secondary">${cropIcon}框选字幕</button><button id="reset-region" class="quiet">底部区域</button><button id="full-region" class="quiet">整幅画面</button><span id="region-info" class="mono" title="拖动字幕框移动，拖动角点缩放，靠近画面中心自动吸附">—</span><button id="test-frame" class="quiet">识别当前帧</button></div>
 <div id="frame-result" class="frame-result" hidden><span class="eyebrow">当前帧</span><span id="frame-text"></span><span id="frame-timing" class="mono"></span></div>
-<div class="settings"><section class="model-section"><div class="settings-heading"><h2><span class="step">01</span>识别模型</h2><span id="backend-badge" class="badge">${navigator.gpu ? 'WebGPU 可用' : 'WASM 可用'}</span></div><div class="model-row"><div><strong>${MODEL_NAME}</strong><p>检测 + 识别 + 字典 · 约 15.6 MB</p></div><button id="load-online" class="secondary">下载并加载模型</button></div><div class="backend-row"><label>推理方式<select id="backend"><option value="auto">自动 · 优先 WebGPU</option><option value="webgpu">WebGPU</option><option value="wasm">WASM · CPU</option></select></label><button id="clear-cache" class="quiet">清除模型缓存</button></div><details id="local-models"><summary>使用本地模型文件</summary><p class="hint">兼容 PP-OCRv4：识别输入高度 48，配套 UTF-8 字符字典。</p><div class="local-files"><label>检测模型<input id="detector-file" type="file" accept=".onnx"></label><label>识别模型<input id="recognizer-file" type="file" accept=".onnx"></label><label>字符字典<input id="dictionary-file" type="file" accept=".txt"></label></div><div class="local-model-footer"><button id="load-local" class="secondary">加载所选文件</button><span class="hint">示例文件：${MODEL_FILES.map(m => `<a href="${m.url}" target="_blank" rel="noreferrer">${m.name}</a>`).join(' · ')}</span></div></details><p id="model-status" class="status-text" role="status">加载一次即可识别；在线模型会缓存在当前浏览器。</p></section>
+<div class="settings"><section class="model-section"><div class="settings-heading"><h2><span class="step">01</span>识别模型</h2><span id="backend-badge" class="badge">${navigator.gpu ? 'WebGPU 可用' : 'WASM 可用'}</span></div><div class="model-row"><div><strong>${MODEL_NAME}</strong><p>中英文 · 检测 + 识别 + 字典 · 约 15.7 MB</p></div><button id="load-online" class="secondary">下载并加载模型</button></div><div class="backend-row"><label>推理方式<select id="backend"><option value="auto">自动 · 优先 WebGPU</option><option value="webgpu">WebGPU</option><option value="wasm">WASM · CPU</option></select></label><button id="clear-cache" class="quiet">清除模型缓存</button></div><details id="local-models"><summary>使用本地模型文件</summary><p class="hint">支持 PP-OCRv4 / v5 兼容模型，字典须与识别模型配套；预设组合使用 v4 字典。</p><div class="local-files"><label>检测模型<input id="detector-file" type="file" accept=".onnx"></label><label>识别模型<input id="recognizer-file" type="file" accept=".onnx"></label><label>字符字典<input id="dictionary-file" type="file" accept=".txt"></label></div><div class="local-model-footer"><button id="load-local" class="secondary">加载所选文件</button><span class="hint">示例文件：${MODEL_FILES.map(m => `<a href="${m.url}" target="_blank" rel="noreferrer">${m.name}</a>`).join(' · ')}</span></div></details><p id="model-status" class="status-text" role="status">加载一次即可识别；在线模型会缓存在当前浏览器。</p></section>
 <section class="scan-section"><div class="settings-heading"><h2><span class="step">02</span>识别范围</h2><button id="whole-video" class="quiet">整段视频</button></div><div class="scan-fields"><label>开始时间<input id="range-start" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>结束时间<input id="range-end" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>采样密度<select id="interval"><option value="500">2 帧 / 秒 · 快速</option><option value="250" selected>4 帧 / 秒 · 标准</option><option value="100">10 帧 / 秒 · 精细</option></select></label></div><div class="scan-options"><label class="check" title="WebGPU 将相同尺寸的裁图两张一组处理；关闭可对照单张速度。"><input id="batch-ocr" type="checkbox" checked>批量加速</label><label class="check" title="笔画相似且两次识别一致时复用结果，定期重新识别；取消勾选可对照效果。"><input id="deduplicate" type="checkbox" checked>画面去重</label><label class="check"><input id="refine" type="checkbox" checked>精修变化边界</label><label class="confidence-control">最低识别置信度<input id="confidence" type="number" value="0.75" min="0.1" max="0.99" step="0.05"></label></div><p class="hint">精修在已发现的变化附近以 50 ms 采样；短于采样间隔的字幕仍可能漏检。</p></section></div>
 <div class="run-bar"><div><p id="run-status" role="status">选择视频并加载模型后开始。</p><span id="run-detail" class="hint">建议先识别 30–60 秒，确认字幕区域和效果。</span></div><button id="cancel" class="secondary" hidden>停止</button><button id="extract" class="primary">${playIcon}开始提取</button></div><progress id="progress" value="0" max="1" aria-label="提取进度"></progress>
 </section><aside class="timeline-panel"><div class="timeline-heading"><div><span class="eyebrow">TIMELINE / 字幕时间轴</span><h2><span id="cue-count">0</span> 条字幕</h2></div><label class="quiet file-action import-action">导入 JSON<input id="import-json" type="file" accept=".json"></label></div><div class="timeline-summary"><span id="review-count">0 条待复核</span><span id="timeline-duration" class="mono">00:00:00.000</span></div><canvas id="timeline" height="48" aria-label="字幕分布，点击跳转"></canvas><div class="list-tools"><input id="search" type="search" placeholder="搜索字幕…" aria-label="搜索字幕"><label class="check"><input id="review-only" type="checkbox">待复核</label></div><div id="cue-list" class="cue-list"><div class="timeline-empty"><span class="empty-number">Aa</span><p>识别后的字幕会显示在这里</p><span>点击时间跳转 · 编辑文本与起止时间</span></div></div><div class="timeline-footer"><div class="export-actions"><button data-export="srt" class="secondary">导出 SRT</button><button data-export="vtt" class="secondary">WebVTT</button><button data-export="json" class="secondary">JSON</button></div><div class="footer-actions"><button id="add-cue" class="quiet">＋ 添加字幕</button><button id="clear-cues" class="quiet">清空时间轴</button></div></div></aside></main>
@@ -54,7 +54,8 @@ let sourceURL: string | undefined;
 let region: Region = readSavedRegion();
 let engine: OcrEngine | undefined;
 let engineReady = false, engineBackend = '', engineModel = MODEL_NAME;
-let modelMode: 'online' | 'local' | undefined, cachedModels = false;
+let modelMode: 'online' | 'local' | undefined;
+let modelCacheState: ModelCacheState = 'empty';
 let active: AbortController | undefined;
 let busy: 'model' | 'scan' | 'frame' | undefined;
 let project: Project | undefined;
@@ -97,7 +98,7 @@ function refreshControls() {
   for (const id of ['load-online', 'load-local', 'backend', 'detector-file', 'recognizer-file', 'dictionary-file', 'video-file', 'video-file-empty', 'import-json', 'select-region', 'reset-region', 'full-region', 'range-start', 'range-end', 'interval', 'confidence', 'refine', 'batch-ocr', 'deduplicate', 'whole-video', 'clear-cache', 'clear-cues', 'add-cue']) ($<HTMLInputElement>(id)).disabled = locked;
   const onlineButton = $<HTMLButtonElement>('load-online');
   onlineButton.disabled = locked || (engineReady && modelMode === 'online');
-  onlineButton.textContent = busy === 'model' && modelMode === 'online' ? '加载模型中…' : engineReady && modelMode === 'online' ? '模型已就绪' : engineReady && modelMode === 'local' ? '切换到预设模型' : cachedModels ? '加载缓存模型' : '下载并加载模型';
+  onlineButton.textContent = busy === 'model' && modelMode === 'online' ? '加载模型中…' : engineReady && modelMode === 'online' ? '模型已就绪' : engineReady && modelMode === 'local' ? '切换到预设模型' : modelCacheState === 'ready' ? '加载缓存模型' : modelCacheState === 'upgrade' ? '更新并加载模型' : '下载并加载模型';
   $('load-local').textContent = busy === 'model' && modelMode === 'local' ? '加载模型中…' : engineReady && modelMode === 'local' ? '重新加载本地模型' : '加载所选文件';
   $<HTMLButtonElement>('extract').disabled = locked || !source || !engineReady;
   $<HTMLButtonElement>('test-frame').disabled = locked || !source || !engineReady;
@@ -277,7 +278,7 @@ async function loadModel(mode: 'online' | 'local') {
       fallback = `WebGPU 未能加载，已回退 WASM。${message(error)}`;
       disposeEngine(); $('model-status').textContent = 'WebGPU 加载失败，尝试 WASM…'; result = await initialize('wasm');
     }
-    signal.throwIfAborted(); engineReady = true; engineBackend = result.backend; engineModel = mode === 'online' ? MODEL_NAME : '本地 PP-OCRv4 兼容模型';
+    signal.throwIfAborted(); engineReady = true; engineBackend = result.backend; engineModel = mode === 'online' ? MODEL_NAME : '本地 PP-OCR 兼容模型';
     $('backend-badge').textContent = result.backend === 'webgpu' ? 'WebGPU 已启用' : 'WASM · CPU';
     $('model-status').textContent = fallback || `模型已就绪 · ${result.dictionarySize - 1} 个字符类别${result.gpu ? ' · ' + result.gpu : ''}`;
     $('run-status').textContent = source ? '已就绪，可以开始提取。' : '模型已载入，请选择视频。';
@@ -286,11 +287,11 @@ async function loadModel(mode: 'online' | 'local') {
     disposeEngine();
     $('model-status').textContent = signal.aborted ? '模型加载已取消。' : message(error);
     $('run-status').textContent = '模型尚未就绪。'; if (!signal.aborted) toast(message(error), true);
-  } finally { cachedModels = await hasCachedModels(); busy = undefined; active = undefined; refreshControls(); }
+  } finally { modelCacheState = await getModelCacheState(); busy = undefined; active = undefined; refreshControls(); }
 }
 $('load-online').onclick = () => void loadModel('online');
 $('load-local').onclick = () => void loadModel('local');
-$('clear-cache').onclick = async () => { try { await clearModelCache(); cachedModels = false; refreshControls(); if (!engineReady && !busy) $('model-status').textContent = '模型缓存已清除，请下载或选择本地模型。'; toast('在线模型缓存已清除。'); } catch { toast('当前浏览器无法访问模型缓存。', true); } };
+$('clear-cache').onclick = async () => { try { await clearModelCache(); modelCacheState = 'empty'; refreshControls(); if (!engineReady && !busy) $('model-status').textContent = '模型缓存已清除，请下载或选择本地模型。'; toast('在线模型缓存已清除。'); } catch { toast('当前浏览器无法访问模型缓存。', true); } };
 $('backend').onchange = () => { try { localStorage.setItem('sub-extract-backend', $<HTMLSelectElement>('backend').value); } catch { /* Storage may be unavailable. */ } engineReady = false; disposeEngine(); $('model-status').textContent = '推理方式已更改，请重新加载模型。'; $('backend-badge').textContent = '待加载'; refreshControls(); };
 
 function updateTransport() {
@@ -573,7 +574,7 @@ try { const batch = localStorage.getItem('sub-extract-batch'); if (batch !== nul
 try { const preferred = localStorage.getItem('sub-extract-backend'); if (preferred && ['auto', 'webgpu', 'wasm'].includes(preferred)) $<HTMLSelectElement>('backend').value = preferred; } catch { /* Use the default backend. */ }
 setupPwa(toast);
 updateRegion(); refreshControls();
-void hasCachedModels().then(cached => {
-  cachedModels = cached; refreshControls();
-  if (cached && !engineReady && !busy) void loadModel('online');
+void getModelCacheState().then(state => {
+  modelCacheState = state; refreshControls();
+  if (state !== 'empty' && !engineReady && !busy) void loadModel('online');
 });

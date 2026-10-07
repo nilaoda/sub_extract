@@ -75,7 +75,7 @@ async function init(data: { wasm: ArrayBuffer; detector: ArrayBuffer; recognizer
     finally { input.dispose(); Object.values(out).forEach(t => t.dispose()); }
   } catch (error) {
     await detector?.release(); await recognizer?.release(); detector = undefined; recognizer = undefined;
-    throw new Error(`模型初始化失败：${error instanceof Error ? error.message : String(error)}。本地模型需要兼容 PP-OCRv4（识别输入高度 48、CTC 输出）及配套字典。`);
+    throw new Error(`模型初始化失败：${error instanceof Error ? error.message : String(error)}。本地模型需要兼容 PP-OCR（DB 检测、识别输入高度 48、CTC 输出）及识别模型配套字典。`);
   }
   return { backend, dictionarySize: dictionary.length, gpu: device?.adapterInfo?.description || device?.adapterInfo?.vendor || '' };
 }

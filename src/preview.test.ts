@@ -7,6 +7,7 @@ class Preview extends EventTarget {
   duration = 60.16;
   currentTime = 0;
   seeking = false;
+  readyState = 2;
   paused = false;
   pause() { this.paused = true; }
   get element() { return this as unknown as HTMLVideoElement; }
@@ -94,4 +95,45 @@ test('raw-time seeking also accepts frame submission before seeked, while ignori
   video.present(0); assert.equal(video.callbacks.size, 1);
   video.present(13.32); await Promise.resolve(); assert(!complete);
   video.seeking = false; video.dispatchEvent(new Event('seeked')); await seek; assert(complete);
+});
+
+test('a decoded paused seek completes when no new frame callback arrives', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  const video = new FramePreview(); let complete = false;
+  const seek = seekPreview(video.element, 13390, new AbortController().signal, 13360).then(() => { complete = true; });
+  video.dispatchEvent(new Event('seeked'));
+  context.mock.timers.tick(299); await Promise.resolve(); assert(!complete);
+  context.mock.timers.tick(1); await seek;
+  assert(complete); assert.equal(video.callbacks.size, 0);
+  context.mock.timers.tick(8000); // No late timeout after the successful fallback.
+});
+
+test('a seek with no seeked event can complete only after the target frame is decoded', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  const video = new FramePreview();
+  const seek = seekPreview(video.element, 13380, new AbortController().signal, 13360);
+  context.mock.timers.tick(300); await seek;
+  assert.equal(video.callbacks.size, 0);
+});
+
+test('fallback still rejects stalled decoding or a different seek position', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const state of [{ seeking: true }, { readyState: 1 }, { currentTime: 13.32 }]) {
+    const video = new FramePreview();
+    const seek = seekPreview(video.element, 13380, new AbortController().signal, 13360);
+    Object.assign(video, state);
+    const failed = assert.rejects(seek, /视频跳转超时/);
+    context.mock.timers.tick(8000); await failed;
+    assert.equal(video.callbacks.size, 0);
+  }
+});
+
+test('cancellation also removes the decoded-frame fallback timer', async context => {
+  context.mock.timers.enable({ apis: ['setTimeout'] });
+  const video = new FramePreview(), controller = new AbortController();
+  const seek = seekPreview(video.element, 13380, controller.signal, 13360);
+  const cancelled = assert.rejects(seek, { name: 'AbortError' });
+  controller.abort(); await cancelled;
+  context.mock.timers.tick(8000);
+  assert.equal(video.callbacks.size, 0);
 });

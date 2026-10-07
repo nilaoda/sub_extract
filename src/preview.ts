@@ -26,7 +26,7 @@ export function timelineCueAt(cues: Cue[], timeMs: number, durationMs: number, c
   }
 }
 
-/** Seek precisely, stop playback, and wait for the requested frame to reach the compositor. */
+/** Prefer compositor confirmation; some paused seeks do not submit another frame callback. */
 export function seekPreview(video: HTMLVideoElement, timeMs: number, signal: AbortSignal, frameTimeMs?: number): Promise<void> {
   signal.throwIfAborted();
   if (!Number.isFinite(timeMs) || !Number.isFinite(video.duration)) return Promise.reject(new Error('视频尚未就绪。'));
@@ -35,21 +35,40 @@ export function seekPreview(video: HTMLVideoElement, timeMs: number, signal: Abo
   if (!video.seeking && Math.abs(video.currentTime - seconds) < 0.000001) return Promise.resolve();
   return new Promise((resolve, reject) => {
     let seekDone = false, frameDone = typeof video.requestVideoFrameCallback !== 'function', frameCallback: number | undefined;
+    let decodedTimer: ReturnType<typeof setTimeout> | undefined;
+    const atTarget = () => !video.seeking && Math.abs(video.currentTime - seconds) <= 0.001;
+    const hasDecodedTarget = () => atTarget() && video.readyState >= 2; // HAVE_CURRENT_DATA
     const cleanup = () => {
       clearTimeout(timer);
+      clearTimeout(decodedTimer);
       if (frameCallback !== undefined) video.cancelVideoFrameCallback(frameCallback);
       video.removeEventListener('seeked', onSeeked);
       video.removeEventListener('error', onError);
       signal.removeEventListener('abort', onAbort);
     };
     const complete = () => { if (seekDone && frameDone) { cleanup(); resolve(); } };
+    const waitForDecodedTarget = () => {
+      clearTimeout(decodedTimer);
+      // Give a matching compositor callback priority. A completed seek with
+      // current frame data is still valid when callbacks are coalesced, paused
+      // or throttled in a background tab. currentTime assignment alone is not.
+      decodedTimer = setTimeout(() => {
+        if (hasDecodedTarget()) { cleanup(); resolve(); }
+      }, 300);
+    };
     const onSeeked = () => {
-      if (video.seeking || Math.abs(video.currentTime - seconds) > 0.001) return;
-      seekDone = true; complete();
+      if (!atTarget()) return;
+      seekDone = true;
+      if (!frameDone) waitForDecodedTarget();
+      complete();
     };
     const onError = () => { cleanup(); reject(new Error('无法跳转到该视频位置。')); };
     const onAbort = () => { cleanup(); reject(signal.reason); };
-    const timer = setTimeout(() => { cleanup(); reject(new Error('视频跳转超时，请重试。')); }, 8000);
+    const timer = setTimeout(() => {
+      cleanup();
+      if (hasDecodedTarget()) resolve();
+      else reject(new Error('视频跳转超时，请重试。'));
+    }, 8000);
     video.addEventListener('seeked', onSeeked);
     video.addEventListener('error', onError);
     signal.addEventListener('abort', onAbort, { once: true });
@@ -63,6 +82,6 @@ export function seekPreview(video: HTMLVideoElement, timeMs: number, signal: Abo
     };
     if (!frameDone) frameCallback = video.requestVideoFrameCallback(onFrame);
     // fastSeek may land on a nearby keyframe seconds away from the requested time.
-    try { video.currentTime = seconds; } catch (error) { cleanup(); reject(error); }
+    try { video.currentTime = seconds; waitForDecodedTarget(); } catch (error) { cleanup(); reject(error); }
   });
 }

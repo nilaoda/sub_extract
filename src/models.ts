@@ -1,7 +1,9 @@
-export const MODEL_NAME = 'PP-OCRv4 · 中英文';
+export const MODEL_NAME = 'PP-OCRv5 mobile 检测 + v4 识别';
 const modelRoot = 'https://huggingface.co/OleehyO/paddleocrv4.onnx/resolve/da2c446aa67d75f1d5dac725772e8b68d1b53bf0/';
+const detectorUrl = 'https://huggingface.co/x3zvawq/paddleocr-js-onnx/resolve/51c2133b5a7ea27b795fa8c400fdbfbd5337dd6a/ppocr_v5_mobile/PP-OCRv5_mobile_det_infer.onnx';
+const legacyDetectorSha = 'c255248806ccdf52d6af1e45e362e6b27dcb770c6e2b92707459ee9a20f54587';
 export const MODEL_FILES = [
-  { key: 'detector', name: '文字检测', url: modelRoot + 'ch_PP-OCRv4_det.onnx', sha: 'c255248806ccdf52d6af1e45e362e6b27dcb770c6e2b92707459ee9a20f54587' },
+  { key: 'detector', name: '文字检测 · v5 mobile', url: detectorUrl, sha: '4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae' },
   { key: 'recognizer', name: '文字识别', url: modelRoot + 'ch_PP-OCRv4_rec.onnx', sha: '8cd07d8689f3a0ba58741c97eea1bc4964bc60f005ef1802ba54c8cd4abd28c3' },
   { key: 'dictionary', name: '字符字典', url: 'https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/8cce9b6fd7ccb50226d0c38f94054d81c29b8184/ppocr/utils/ppocr_keys_v1.txt', sha: '28b2362ad4ab2dc38769aa72feb535e3a9ddb3fd2a7585a05920e6393b1dc7f7' },
 ] as const;
@@ -33,18 +35,23 @@ async function putCached(key: string, bytes: ArrayBuffer) {
     });
   } catch { /* Private mode / quota failure must not prevent using downloaded models. */ }
 }
-export async function hasCachedModels(): Promise<boolean> {
+export type ModelCacheState = 'ready' | 'upgrade' | 'empty';
+export async function getModelCacheState(): Promise<ModelCacheState> {
   try {
     const db = await database();
     try {
       const transaction = db.transaction('files', 'readonly'), files = transaction.objectStore('files');
-      const counts = await Promise.all(MODEL_FILES.map(spec => new Promise<number>((resolve, reject) => {
-        const request = files.count(spec.sha);
+      const keys = [...MODEL_FILES.map(spec => spec.sha), legacyDetectorSha];
+      const counts = await Promise.all(keys.map(key => new Promise<number>((resolve, reject) => {
+        const request = files.count(key);
         request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
       })));
-      return counts.every(count => count > 0);
+      if (counts.slice(0, MODEL_FILES.length).every(count => count > 0)) return 'ready';
+      // A complete old preset can reuse its recognizer and dictionary. Only the
+      // new detector is downloaded; an old detector is never loaded as v5.
+      return counts[1] > 0 && counts[2] > 0 && counts[3] > 0 ? 'upgrade' : 'empty';
     } finally { db.close(); }
-  } catch { return false; }
+  } catch { return 'empty'; }
 }
 export async function clearModelCache() {
   const db = await database();
@@ -90,6 +97,6 @@ export async function downloadModels(signal: AbortSignal, progress: (message: st
 }
 export async function localModels(detector?: File, recognizer?: File, dictionary?: File): Promise<ModelData> {
   if (!detector || !recognizer || !dictionary) throw new Error('请分别选择检测模型、识别模型和字符字典。');
-  if (detector.size > 200_000_000 || recognizer.size > 200_000_000 || dictionary.size > 2_000_000) throw new Error('本地模型文件过大。请使用轻量 PP-OCRv4 模型。');
+  if (detector.size > 200_000_000 || recognizer.size > 200_000_000 || dictionary.size > 2_000_000) throw new Error('本地模型文件过大。请使用轻量 PP-OCR 模型。');
   return { detector: await detector.arrayBuffer(), recognizer: await recognizer.arrayBuffer(), dictionary: await dictionary.text() };
 }
