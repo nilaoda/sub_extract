@@ -2,7 +2,8 @@ import * as ort from 'onnxruntime-web/webgpu';
 import { decodeCTC, restoreVisualSpaces, filterUnsupportedEdgeTokens, outlinedTextProjection, clamp, mergeTextBoxes, type OcrLine, type Region } from './core';
 import type { OcrTimings } from './performance';
 import { CompatibleBatchRunner, groupOcrJobs, OCR_WINDOW_FRAMES, OCR_WINDOW_BYTES } from './ocr-batch';
-import type { OcrBatchCounts } from './ocr';
+import type { OcrBatchCounts, OcrWindowOptions, OcrWindowResult } from './ocr';
+import { FrameReuse, FrameSignatureReader } from './frame-change';
 
 let detector: ort.InferenceSession | undefined;
 let recognizer: ort.InferenceSession | undefined;
@@ -235,7 +236,7 @@ async function joinInputs(inputs: ort.Tensor[], width: number, height: number) {
   } catch (error) { buffer.destroy(); throw error; }
 }
 
-async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number) {
+async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, batch = true) {
   if (!detector || !recognizer) throw new Error('请先加载模型。');
   if (!bitmaps.length || bitmaps.length > OCR_WINDOW_FRAMES) throw new Error('每次最多处理 8 张裁图。');
   const bytes = bitmaps.reduce((sum, bitmap) => sum + bitmap.width * bitmap.height * 4, 0);
@@ -293,7 +294,7 @@ async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number) {
     const scale = Math.min(1, 1536 / Math.max(bitmap.width, bitmap.height));
     return { index, width: Math.max(32, Math.round(bitmap.width * scale / 32) * 32), height: Math.max(32, Math.round(bitmap.height * scale / 32) * 32) };
   });
-  for (const group of groupOcrJobs(detectJobs)) {
+  for (const group of groupOcrJobs(detectJobs, batch ? 2 : 1)) {
     // Large selections can greatly increase activation memory. Run them singly.
     const groups = group[0].width * group[0].height > 512 * 1024 ? group.map(job => [job]) : [group];
     for (const jobs of groups) {
@@ -323,7 +324,7 @@ async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number) {
       recognitionJobs.push({ index, box, contentWidth, width: Math.max(320, Math.ceil(contentWidth / 32) * 32), height: 48 });
     }
   });
-  for (const jobs of groupOcrJobs(recognitionJobs)) {
+  for (const jobs of groupOcrJobs(recognitionJobs, batch ? 2 : 1)) {
     const values = await recognizerBatch.run(jobs, batch => infer(recognizer!, batch, true));
     jobs.forEach((job, i) => {
       const value = values[i], ctcStarted = performance.now();
@@ -342,13 +343,40 @@ async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number) {
   return { values: lines.map(assembleLines), elapsed: performance.now() - started, counts, fallback: !detectorBatch.enabled || !recognizerBatch.enabled, ...(timings ? { timings } : {}) };
 }
 
+const frameReuse = new FrameReuse();
+let signatureReader: FrameSignatureReader | undefined;
+async function recognizeChangedWindow(data: { bitmaps: ImageBitmap[]; minConfidence: number } & OcrWindowOptions): Promise<OcrWindowResult> {
+  const { bitmaps, minConfidence } = data;
+  if (!data.deduplicate) return { ...await recognizeWindow(bitmaps, minConfidence, data.batch), reusedFrames: 0, ocrFrames: bitmaps.length };
+  if (!bitmaps.length || bitmaps.length > OCR_WINDOW_FRAMES || (bitmaps.length > 1 && bitmaps.reduce((sum, bitmap) => sum + bitmap.width * bitmap.height * 4, 0) > OCR_WINDOW_BYTES)) throw new Error('裁图暂存量超过限制。');
+  if (!data.scope || !data.times) throw new Error('画面去重需要任务标识和采样时间。');
+  const started = performance.now();
+  signatureReader ||= new FrameSignatureReader();
+  const signatures = bitmaps.map(bitmap => signatureReader!.read(bitmap));
+  const signatureMs = performance.now() - started;
+  frameReuse.reset(data.scope);
+  const counts: OcrBatchCounts = { detectorCalls: 0, detectorBatch2: 0, recognizerCalls: 0, recognizerBatch2: 0 };
+  let timings: OcrTimings | undefined, fallback = false, ocrFrames = 0;
+  const result = await frameReuse.recognize(signatures, data.times, async indices => {
+    const result = await recognizeWindow(indices.map(index => bitmaps[index]), minConfidence, data.batch);
+    ocrFrames += indices.length; fallback ||= result.fallback;
+    for (const key of Object.keys(counts) as (keyof OcrBatchCounts)[]) counts[key] += result.counts[key];
+    if (result.timings) {
+      if (!timings) timings = { ...result.timings };
+      else for (const key of Object.keys(timings) as (keyof OcrTimings)[]) timings[key] += result.timings[key];
+    }
+    return result.values;
+  });
+  return { ...result, ocrFrames, signatureMs, counts, fallback, elapsed: performance.now() - started, ...(timings ? { timings } : {}) };
+}
+
 // The shared canvas and sessions require serialized requests, including init.
 let tasks = Promise.resolve();
 self.onmessage = (event: MessageEvent) => {
   const { id, type, data } = event.data;
   tasks = tasks.then(async () => {
     try {
-      const result = type === 'init' ? await init(data) : type === 'window' ? await recognizeWindow(data.bitmaps, data.minConfidence) : await recognize(data.bitmap, data.minConfidence);
+      const result = type === 'init' ? await init(data) : type === 'window' ? await recognizeChangedWindow(data) : await recognize(data.bitmap, data.minConfidence);
       self.postMessage({ id, result });
     } catch (error) { self.postMessage({ id, error: error instanceof Error ? error.message : String(error) }); }
     finally {

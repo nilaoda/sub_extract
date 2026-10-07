@@ -1,6 +1,6 @@
 export interface Region { x: number; y: number; width: number; height: number }
 export interface OcrLine { text: string; confidence: number; box: Region; spacingInferred?: boolean; edgeFiltered?: boolean }
-export interface Observation { time: number; text: string; confidence: number; lines: OcrLine[] }
+export interface Observation { time: number; text: string; confidence: number; lines: OcrLine[]; ocrTime?: number }
 export interface Cue {
   id: string; start: number; end: number; text: string; lines: string[];
   confidence: number; needsReview: boolean; sampleTime: number; box?: Region;
@@ -177,7 +177,7 @@ export function buildCues(observations: Observation[], rangeStart: number, range
   }
   return consolidated.filter(run => run.text && run.end > run.start).map((run, index) => {
     const best = run.votes.get(run.text)!.best, confidence = run.duration ? run.confidenceSum / run.duration : best.confidence;
-    return { id: `cue-${String(index + 1).padStart(4, '0')}`, start: Math.round(run.start), end: Math.round(run.end), text: run.text, lines: run.text.split('\n'), confidence, needsReview: confidence < 0.88 || run.samples === 1 || run.votes.size > 1 || run.duration <= FLICKER_MS || run.visualCorrection, sampleTime: best.time, box: best.lines[0]?.box };
+    return { id: `cue-${String(index + 1).padStart(4, '0')}`, start: Math.round(run.start), end: Math.round(run.end), text: run.text, lines: run.text.split('\n'), confidence, needsReview: confidence < 0.88 || run.samples === 1 || run.votes.size > 1 || run.duration <= FLICKER_MS || run.visualCorrection, sampleTime: best.ocrTime ?? best.time, box: best.lines[0]?.box };
   });
 }
 

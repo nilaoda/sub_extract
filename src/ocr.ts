@@ -6,7 +6,8 @@ import type { OcrTimings } from './performance';
 export interface OcrTextResult { text: string; confidence: number; lines: OcrLine[] }
 export interface OcrBatchCounts { detectorCalls: number; detectorBatch2: number; recognizerCalls: number; recognizerBatch2: number }
 export interface OcrResult extends OcrTextResult { elapsed: number; timings?: OcrTimings; counts?: OcrBatchCounts }
-export interface OcrWindowResult { values: OcrTextResult[]; elapsed: number; timings?: OcrTimings; counts: OcrBatchCounts; fallback: boolean }
+export interface OcrWindowOptions { batch?: boolean; deduplicate?: boolean; times?: number[]; scope?: string }
+export interface OcrWindowResult { values: OcrTextResult[]; elapsed: number; timings?: OcrTimings; counts: OcrBatchCounts; fallback: boolean; sourceTimes?: number[]; reusedFrames?: number; ocrFrames?: number; signatureMs?: number }
 export class OcrEngine {
   private worker = new OcrWorker();
   private disposed = false;
@@ -50,8 +51,8 @@ export class OcrEngine {
     try { return await this.call<OcrResult>('recognize', { bitmap, minConfidence }, [bitmap]); }
     finally { bitmap.close(); }
   }
-  async recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number) {
-    try { return await this.call<OcrWindowResult>('window', { bitmaps, minConfidence }, bitmaps); }
+  async recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, options: OcrWindowOptions = {}) {
+    try { return await this.call<OcrWindowResult>('window', { bitmaps, minConfidence, ...options }, bitmaps); }
     finally { bitmaps.forEach(bitmap => bitmap.close()); }
   }
   dispose() { this.fail(new Error('模型任务已取消。')); }
