@@ -1,0 +1,18 @@
+{
+  "id": "./",
+  "name": "Sub Extract · 硬字幕提取",
+  "short_name": "Sub Extract",
+  "description": "本地识别视频硬字幕，编辑时间轴并导出 SRT、WebVTT 与 JSON。",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#111516",
+  "theme_color": "#111516",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" },
+    { "src": "./icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "./icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" },
+    { "src": "./icon-1024.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

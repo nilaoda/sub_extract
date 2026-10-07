@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.pages/
+.local-test/
+*.log
+.DS_Store

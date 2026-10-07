@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import { readFile, readdir } from 'node:fs/promises';
+import { gunzipSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
+assert.deepEqual(await readdir('dist'), ['sub-extract.html']);
+const html = await readFile('dist/sub-extract.html', 'utf8');
+assert(!/<script\b[^>]*\bsrc\s*=/.test(html), 'External script');
+assert(!/<link\b[^>]*rel="(?:stylesheet|modulepreload)"/.test(html), 'External style/module');
+assert(!/src="\/src\//.test(html));
+assert(/<script\b[^>]*id="ort-wasm-data"[^>]*type="application\/octet-stream"/.test(html), 'WASM must be stored as inert HTML data');
+const encoded = /<script\b[^>]*id="ort-wasm-data"[^>]*data-compression="gzip"[^>]*>([^<]+)<\/script>/.exec(html)?.[1];
+assert(encoded, 'Missing compressed runtime');
+const wasm = gunzipSync(Buffer.from(encoded, 'base64'));
+const expected = await readFile('node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm');
+const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+assert.equal(sha(wasm), sha(expected), 'Embedded runtime was modified');
+assert(html.includes('Copyright (c) 2026 Sub Extract contributors'), 'Missing project license');
+console.log('Verified: one HTML, embedded JS / CSS / worker / WASM.');

@@ -1,0 +1,180 @@
+# Sub Extract
+
+在浏览器中识别视频里的硬字幕，整理成可编辑的字幕时间轴，导出 **SRT、WebVTT 和 JSON**。
+
+最终产物只有一个 HTML 文件。视频解码和 OCR 在本机完成，视频不会上传；模型可以在线下载，也可以手动选择本地文件。支持 WebGPU 加速及 WASM 回退。
+
+## 功能
+
+- 本地 MP4 / MOV 视频预览，按指定时间范围提取字幕。
+- 自由框选字幕区域，随时拖动、调整大小，靠近画面中心自动吸附。
+- PP-OCRv4 中英文识别，模型下载校验与浏览器缓存。
+- 跨帧文本合并、短暂漏字稳定处理及字幕边界精修。
+- 提取进度、停止任务和保留部分结果。
+- 字幕文字与时间编辑、搜索、待复核标记和播放定位。
+- SRT / WebVTT 导出，以及 JSON 项目导出、导入。
+- 单文件运行，支持直接打开本地 HTML 和离线模型加载。
+
+## 使用
+
+使用新版桌面 **Chrome / Edge** 打开构建生成的 `dist/sub-extract.html`，无需启动服务器。
+
+1. 点击选择本地视频，或将 MP4 / MOV / M4V 文件拖入视频区域，把播放位置移到有字幕的画面。已加载视频时可再次拖入以更换；一次支持一个文件。
+2. 用默认底部区域，或点击「重新框选」选中完整字幕及少量边距。
+3. 点击「下载并加载模型」，或在「使用本地模型文件」中选择检测模型、识别模型和字典。
+4. 点击「识别当前帧」，检查区域和识别结果。
+5. 设置处理起止时间并开始提取。时间支持 `00:10:03.000`、`10:03.000` 或秒数 `603`。
+6. 检查右侧时间轴，修正待复核项，再导出所需格式。
+
+默认每秒采样 4 帧，并在已发现的变化附近精修字幕边界。导出时间对应所选视频的绝对时间；从原视频的中间开始提取不会将时间归零。
+
+### 调整字幕区域
+
+- 拖动框内任意位置移动区域，拖动四个角点调整大小。
+- 按住 Ctrl 或 macOS 的 Command（⌘）拖动框内或边缘时，中心固定：左右拖动对称调整宽度，上下拖动对称调整高度；按住同一修饰键拖动角点可同时调整宽高。兼容系统交换 Ctrl / Command 的设置。拖动时会显示中心锚点，并限制在画面范围内。
+- 框的水平或垂直中心接近画面中心时会自动吸附，并显示参考线。
+- 选中框后，用方向键移动 1 个视频像素；按住 Shift 移动 10 个像素。选中角点后，方向键调整大小。
+- 按 Esc 取消当前拖动；「底部区域」「整幅画面」可快速切换预设。
+- 模型加载和识别期间区域会锁定，任务结束后可继续调整。
+
+### 离线使用
+
+单 HTML 已内嵌运行代码、样式、OCR Worker 和 WASM。模型与视频需要单独提供。
+
+首次在线加载模型后，同一浏览器可从 IndexedDB 缓存读取。重新打开页面时检测到完整缓存会自动初始化，无需重复点击或下载；加载完成后按钮显示「模型已就绪」。可以停止初始化，失败后手动重试。推理方式会记住上次选择。也可以提前下载下面的三个文件，通过本地文件选择器加载，全程无需网络。缓存受浏览器、页面来源和隐私模式影响。
+
+## 发布到 GitHub Pages
+
+仓库包含 [GitHub Actions 部署配置](.github/workflows/pages.yml)。推送到 `main` 后会安装依赖、运行测试、构建单 HTML，并连同 PWA 安装与离线访问资源发布。无需将 `dist/`、模型或视频提交到仓库。
+
+1. 在 GitHub 新建公开仓库。首次推送现有项目时，保持远程仓库为空，不勾选自动创建 README、许可证或 `.gitignore`。
+2. 在本地完成首次提交并推送，将下面的地址替换为你的仓库地址：
+
+   ```sh
+   git init -b main
+   git add .
+   git commit -m "Initial release"
+   git remote add origin https://github.com/YOUR_NAME/YOUR_REPO.git
+   git push -u origin main
+   ```
+
+3. 打开仓库 **Settings → Pages → Build and deployment → Source**，选择 **GitHub Actions**。
+4. 在 **Actions → Deploy GitHub Pages** 中点击 **Run workflow**，选择 `main` 运行。以后推送到 `main` 会自动部署。
+5. 部署成功后，在 Settings → Pages 或工作流的部署记录中打开访问链接。项目仓库的地址通常为 `https://YOUR_NAME.github.io/YOUR_REPO/`。
+
+如果默认分支使用其他名称，请同时修改工作流的 `push.branches`。GitHub Pages 提供 HTTPS，可用于 WebGPU；视频仍在用户本机处理。模型缓存按网页来源隔离，在线页面与本地 HTML 的缓存可能不同。
+
+若还希望提供离线下载，可以在 GitHub Releases 中附上构建后的 `dist/sub-extract.html`。
+
+### 安装为应用与离线访问
+
+用 Chrome / Edge 打开 Pages 地址，点击「安装应用」，或使用浏览器菜单中的安装入口。安装后可像普通应用一样从桌面或开始菜单打开。其他浏览器的入口可能叫「添加到主屏幕」；识别仍要求浏览器支持对应的视频解码和 WebCodecs 功能。
+
+首次联网打开并完成离线缓存后，页面可在断网时打开。模型另存于 IndexedDB，在线加载过完整模型后可离线自动初始化。视频需要用户重新选择；浏览器清理网站数据会删除页面与模型缓存。
+
+PWA 需要独立的 Service Worker 和 manifest 文件，因此 Pages 发布包包含多个文件；供下载的 `dist/sub-extract.html` 是单文件。本地直接打开 HTML 不注册 Service Worker。应用更新在联网访问时检查，关闭旧窗口后重新打开可启用新版本。
+
+本地检查 Pages 发布包：
+
+```sh
+npm run build
+npm run build:pages
+npx vite .pages --host 127.0.0.1 --port 4174
+```
+
+然后打开 `http://127.0.0.1:4174/`。普通 HTTP 部署不能注册 Service Worker，localhost 与 GitHub Pages 的 HTTPS 可用。
+
+## 模型
+
+内置下载来源为固定版本的 PP-OCRv4 模型，总大小约 **15.6 MB**，下载时验证 SHA-256。
+
+| 文件 | 下载 |
+| --- | --- |
+| 检测模型 | [ch_PP-OCRv4_det.onnx](https://huggingface.co/OleehyO/paddleocrv4.onnx/resolve/da2c446aa67d75f1d5dac725772e8b68d1b53bf0/ch_PP-OCRv4_det.onnx) |
+| 识别模型 | [ch_PP-OCRv4_rec.onnx](https://huggingface.co/OleehyO/paddleocrv4.onnx/resolve/da2c446aa67d75f1d5dac725772e8b68d1b53bf0/ch_PP-OCRv4_rec.onnx) |
+| 字符字典 | [ppocr_keys_v1.txt](https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/8cce9b6fd7ccb50226d0c38f94054d81c29b8184/ppocr/utils/ppocr_keys_v1.txt) |
+
+本地加载支持 **PP-OCRv4 兼容模型**，需要匹配的字典，不能直接替换为任意 ONNX 模型：
+
+- 检测输入为 BGR / NCHW，DB 输出为 `[1, 1, H, W]` 概率图。
+- 识别输入为 BGR / NCHW，高度 48、动态宽度，输出为 `[1, T, C]` CTC 概率。
+- 字典使用 UTF-8，每行一个字符，不含 CTC blank；程序添加末尾空格。预设模型输出 6625 类。
+- 模型权重需包含在 ONNX 文件中，不支持外部权重文件。
+
+自动模式优先使用 WebGPU，GPU 初始化失败时回退 WASM。部分模型算子可能在 CPU 上执行；WASM 使用单线程，以支持直接打开本地 HTML。
+
+## 格式与限制
+
+支持普通 MP4 / MOV 容器，推荐 H.264。浏览器需支持相应编码及 WebCodecs。TS / MKV、分片 MP4、复杂 edit list 和容器旋转信息需先转换。
+
+识别主要针对固定区域内的横排对白字幕。倾斜、竖排、卡拉 OK、复杂花字和背景纹理可能影响结果。字幕区域应覆盖完整文字，避免混入节目标题、台标等其他文本。
+
+OCR 结果需要复核。程序会合并短暂的相关漏字读法，按持续时间与置信度选择实际识别到的文字；前后稳定读法相同时，还会处理句首「一」短暂误识别成横杠的情况。持续的文字变化和空白间隔仍会保留。持续漏字无法仅靠跨帧合并可靠修复，低置信度、短字幕和同段文字不一致会标记待复核。
+
+对白为浅色字、深色描边时，还会检查首尾汉字是否存在对应的文字笔画。只有其余文字提供充分画面证据、边缘字符几乎没有对应笔画时，才剔除可能来自背景条纹的多字误读；修正后的整条字幕保留待复核标记。
+
+空格保留模型实际识别结果；对中文、浅色且有深色描边的字幕，只有字符中心距离明显超过常规字距、且画面存在可见大间距时，才尝试恢复句间空格，并标记待复核。同一句已识别出部分空格时，也会继续检查其他缺失的空格。不会把 CTC blank 直接当作空格，也不保证恢复原始空格数量；复杂背景、其他字色及中英混排的间距需要人工检查。
+
+常规采样可能漏掉短于采样间隔的字幕。边界精修使用约 50 ms 的采样间隔，仅处理已经发现的变化；实际误差还受视频帧率、淡入淡出与 OCR 波动影响。时间轴对应画面显示时间，未使用音频识别或对白对齐。
+
+JSON 项目保存视频信息、处理范围、字幕区域、模型来源、字幕时间、置信度和复核状态，不嵌入视频或模型。导入后可继续编辑；导出字幕前会检查无效时间、空文本和时间重叠。
+
+点击字幕时间按钮或分布条中的字幕会暂停视频，定位到识别出该文字的实际采样帧，并等待浏览器提交画面后完成预览。字幕起始边界可能位于两帧之间，暂停在边界时仍会显示上一句，因此预览位置与起始时间可以不同；导出使用原始起止时间。原采样帧已不在编辑后的字幕范围内时，预览范围中点。点击分布条空白处和拖动播放进度条可按指定时间定位。播放器显示毫秒；导入项目与视频时长不一致时，请确认选中了对应的视频。
+
+## 开发
+
+需要 **Node.js 22+**。
+
+```sh
+npm ci
+npm run dev
+```
+
+开发地址为 `http://127.0.0.1:5173/`。
+
+```sh
+npm test
+npm run build
+npm run preview
+```
+
+构建后 `dist/` 仅包含 `sub-extract.html`，约 **8.8 MiB**，主要体积来自内嵌的 ONNX Runtime WASM。构建过程会校验单文件产物、运行库完整性及外部脚本、样式引用。预览地址为 `http://127.0.0.1:4173/sub-extract.html`。
+
+WASM 压缩后保存为 HTML 内的不可执行数据块，在加载模型时分块解码，并使用浏览器的 `DecompressionStream` 解压，避免将整个二进制作为 JavaScript 字符串解析。OCR 运行仍需要模型、解码帧与推理内存，建议先用短片段确认设备性能。
+
+### 测试
+
+`npm test` 覆盖跨帧合并、漏字与过度合并回归、检测框合并、区域移动与缩放、修饰键兼容、CTC 解码、空格判断、播放定位、时间格式和导入导出。
+
+另有 PWA 缓存逻辑与图标检查，覆盖离线首页、子目录路径、缓存版本清理与网络错误回退。图标源文件为 `pwa/icon.svg`，安装入口提供 SVG 和 192 / 512 / 1024 px PNG。PNG 从 SVG 以 4–8 倍分辨率渲染，再按像素覆盖率缩小，兼顾圆角平滑与直线锐利；中间图最大 4096 px。安装 `rsvg-convert` 和 Python Pillow 后可运行 `npm run icons` 重新生成，并同步单 HTML 的内嵌 favicon（macOS：`brew install librsvg`；Pillow：`python3 -m pip install Pillow`，可在虚拟环境中安装）。
+
+额外的浏览器测试使用本机 Chrome：
+
+```sh
+npm run test:browser
+npm run test:online
+npm run test:interview -- /path/to/interview-fixture.mp4
+```
+
+浏览器回归测试依赖特定对白素材和 `.local-test/models/` 下的模型文件，视频素材不随仓库发布。`test:browser` 使用 `.local-test/sample-603-645.mp4`，验证离线 OCR、导出导入、区域操作、停止任务和布局；`test:interview` 验证指定采访素材 01:58–02:06 的漏字与边界回归。它们的文本断言针对对应素材，不能直接用任意视频替换。
+
+`test:online` 验证在线下载、WASM 和断网后的模型缓存，需要外网和上述样片。设置 `HEADED=1` 可以显示测试浏览器。模型、视频和测试输出均保存在被 Git 忽略的 `.local-test/` 中。
+
+### 代码结构
+
+| 文件 | 职责 |
+| --- | --- |
+| `src/main.ts` / `src/style.css` | 界面、区域操作、任务流程与字幕编辑 |
+| `src/video.ts` | 视频元数据、按时间戳访问与解码 |
+| `src/ocr.worker.ts` / `src/ocr.ts` | 图像预处理、OCR 与 Worker 通信 |
+| `src/models.ts` | 模型来源、下载校验与缓存 |
+| `src/core.ts` | 文本合并、区域几何、时间格式与导入导出 |
+| `scripts/pack.mjs` / `vite.config.ts` | 单文件打包 |
+
+## 许可证
+
+项目代码使用 [MIT License](LICENSE)，允许使用、修改、分发和商用，需保留版权与许可声明。
+
+运行库与模型保留各自的许可证：ONNX Runtime 使用 MIT，MP4Box.js 使用 BSD-3-Clause，PaddleOCR 及当前在线 ONNX 模型来源标注 Apache-2.0。
+
+详细声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，同时内嵌于 HTML 的使用说明中。模型权重单独下载，不属于 HTML 内嵌资源；项目代码的许可不会替代第三方许可。
