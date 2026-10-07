@@ -233,16 +233,17 @@ export function decodeCTC(data: Float32Array, dims: readonly number[], dictionar
   return { text: text.trim(), confidence: count ? clamp(sum / count, 0, 1) : 0, tokens };
 }
 
-function outlinedTextProjection(pixels: Uint8ClampedArray, width: number, height: number, contentWidth: number) {
+export function outlinedTextProjection(pixels: Uint8ClampedArray, width: number, height: number, contentWidth: number) {
   const columns = new Uint16Array(contentWidth), rows = new Uint16Array(height);
-  const radius = Math.max(1, Math.round(height / 24));
+  const radius = Math.max(1, Math.round(height / 24)), horizontal = radius * 4, vertical = radius * width * 4;
   for (let y = radius; y < height - radius; y++) for (let x = radius; x < contentWidth - radius; x++) {
     const offset = (y * width + x) * 4, r = pixels[offset], g = pixels[offset + 1], b = pixels[offset + 2];
     if (Math.min(r, g, b) < 185 || Math.max(r, g, b) - Math.min(r, g, b) > 70) continue;
-    const outlined = [[x - radius, y], [x + radius, y], [x, y - radius], [x, y + radius]].some(([nx, ny]) => {
-      const index = (ny * width + nx) * 4;
-      return Math.max(pixels[index], pixels[index + 1], pixels[index + 2]) < 125;
-    });
+    const left = offset - horizontal, right = offset + horizontal, top = offset - vertical, bottom = offset + vertical;
+    const outlined = Math.max(pixels[left], pixels[left + 1], pixels[left + 2]) < 125
+      || Math.max(pixels[right], pixels[right + 1], pixels[right + 2]) < 125
+      || Math.max(pixels[top], pixels[top + 1], pixels[top + 2]) < 125
+      || Math.max(pixels[bottom], pixels[bottom + 1], pixels[bottom + 2]) < 125;
     if (outlined) { columns[x]++; rows[y]++; }
   }
   return { columns, rows };
@@ -250,10 +251,10 @@ function outlinedTextProjection(pixels: Uint8ClampedArray, width: number, height
 
 /** Reject an edge glyph hallucinated from background only when the rest of a
  * Chinese line provides strong evidence of bright, dark-outlined text. */
-export function filterUnsupportedEdgeTokens(tokens: CtcToken[], pixels: Uint8ClampedArray, width: number, height: number, steps: number, contentWidth: number): CtcToken[] {
+export function filterUnsupportedEdgeTokens(tokens: CtcToken[], pixels: Uint8ClampedArray, width: number, height: number, steps: number, contentWidth: number, projection?: () => ReturnType<typeof outlinedTextProjection>): CtcToken[] {
   const han = tokens.flatMap((token, i) => /^\p{Script=Han}$/u.test(token.text) ? [i] : []);
   if (han.length < 4 || !tokens.every(token => /^[\p{Script=Han}\p{P}\s]+$/u.test(token.text))) return tokens;
-  const { columns } = outlinedTextProjection(pixels, width, height, contentWidth);
+  const { columns } = projection ? projection() : outlinedTextProjection(pixels, width, height, contentWidth);
   const centers = tokens.map(token => (token.start + token.end) / 2 / steps * width);
   const support = tokens.map((_, i) => {
     const left = i ? (centers[i - 1] + centers[i]) / 2 : 0;
@@ -274,7 +275,7 @@ export function filterUnsupportedEdgeTokens(tokens: CtcToken[], pixels: Uint8Cla
 
 /** Restore only visibly large gaps between Chinese glyphs, using CTC alignment
  * and bright outlined strokes. A CTC blank alone does not mean a literal space. */
-export function restoreVisualSpaces(text: string, tokens: CtcToken[], pixels: Uint8ClampedArray, width: number, height: number, steps: number, contentWidth: number): string {
+export function restoreVisualSpaces(text: string, tokens: CtcToken[], pixels: Uint8ClampedArray, width: number, height: number, steps: number, contentWidth: number, projection?: () => ReturnType<typeof outlinedTextProjection>): string {
   const isHan = (token: CtcToken) => /^\p{Script=Han}$/u.test(token.text);
   const glyphCount = tokens.filter(isHan).length;
   if (glyphCount < 2 || !/^[\p{Script=Han}\p{Zs}]+$/u.test(text) || tokens.some(token => !isHan(token) && !/^\p{Zs}+$/u.test(token.text))) return text;
@@ -284,7 +285,7 @@ export function restoreVisualSpaces(text: string, tokens: CtcToken[], pixels: Ui
   if (!advances.length) return text;
   // A lower median resists a few phrase gaps while retaining ordinary glyph spacing.
   const typicalAdvance = advances[Math.floor((advances.length - 1) / 2)];
-  const { columns, rows } = outlinedTextProjection(pixels, width, height, contentWidth);
+  const { columns, rows } = projection ? projection() : outlinedTextProjection(pixels, width, height, contentWidth);
   const inkRows = [...rows].flatMap((count, y) => count >= glyphCount ? [y] : []);
   if (inkRows.length < height * 0.2) return text;
   const inkHeight = inkRows.at(-1)! - inkRows[0] + 1, minimumGap = Math.max(6, inkHeight * 0.45);

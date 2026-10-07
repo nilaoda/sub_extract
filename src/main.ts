@@ -4,9 +4,11 @@ import thirdPartyNotices from '../THIRD_PARTY_NOTICES.md?raw';
 import projectLicense from '../LICENSE?raw';
 import { DEFAULT_REGION, clamp, buildCues, formatTime, parseTime, exportSubtitles, validateCues, importProject, normalizeText, moveRegion, resizeRegion, resizeRegionFromCenter, cropPointerMode, type CropCorner, type Region, type Observation, type Project, type Cue } from './core';
 import { seekPreview, timelineDuration, cuePreviewTarget, timelineCueAt } from './preview';
-import { OcrEngine, type OcrResult } from './ocr';
+import { OcrEngine, type OcrResult, type OcrTextResult, type OcrWindowResult } from './ocr';
 import { MODEL_NAME, MODEL_FILES, downloadModels, localModels, clearModelCache, hasCachedModels, type ModelData } from './models';
-import { readMetadata, sampleVideo, cropFrame, type VideoMetadata } from './video';
+import { readMetadata, sampleVideo, sampleVideoWindows, cropFrame, type VideoMetadata, type SamplingTimings } from './video';
+import { PerformanceTotals } from './performance';
+import { OcrCropQueue, OCR_WINDOW_FRAMES } from './ocr-batch';
 
 const icon = (path: string) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">${path}</svg>`;
 const uploadIcon = icon('<path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/>');
@@ -21,7 +23,7 @@ document.querySelector('#app')!.innerHTML = `
 <div class="crop-toolbar"><button id="select-region" class="secondary">${cropIcon}框选字幕</button><button id="reset-region" class="quiet">底部区域</button><button id="full-region" class="quiet">整幅画面</button><span id="region-info" class="mono" title="拖动字幕框移动，拖动角点缩放，靠近画面中心自动吸附">—</span><button id="test-frame" class="quiet">识别当前帧</button></div>
 <div id="frame-result" class="frame-result" hidden><span class="eyebrow">当前帧</span><span id="frame-text"></span><span id="frame-timing" class="mono"></span></div>
 <div class="settings"><section class="model-section"><div class="settings-heading"><h2><span class="step">01</span>识别模型</h2><span id="backend-badge" class="badge">${navigator.gpu ? 'WebGPU 可用' : 'WASM 可用'}</span></div><div class="model-row"><div><strong>${MODEL_NAME}</strong><p>检测 + 识别 + 字典 · 约 15.6 MB</p></div><button id="load-online" class="secondary">下载并加载模型</button></div><div class="backend-row"><label>推理方式<select id="backend"><option value="auto">自动 · 优先 WebGPU</option><option value="webgpu">WebGPU</option><option value="wasm">WASM · CPU</option></select></label><button id="clear-cache" class="quiet">清除模型缓存</button></div><details id="local-models"><summary>使用本地模型文件</summary><p class="hint">兼容 PP-OCRv4：识别输入高度 48，配套 UTF-8 字符字典。</p><div class="local-files"><label>检测模型<input id="detector-file" type="file" accept=".onnx"></label><label>识别模型<input id="recognizer-file" type="file" accept=".onnx"></label><label>字符字典<input id="dictionary-file" type="file" accept=".txt"></label></div><div class="local-model-footer"><button id="load-local" class="secondary">加载所选文件</button><span class="hint">示例文件：${MODEL_FILES.map(m => `<a href="${m.url}" target="_blank" rel="noreferrer">${m.name}</a>`).join(' · ')}</span></div></details><p id="model-status" class="status-text" role="status">加载一次即可识别；在线模型会缓存在当前浏览器。</p></section>
-<section class="scan-section"><div class="settings-heading"><h2><span class="step">02</span>识别范围</h2><button id="whole-video" class="quiet">整段视频</button></div><div class="scan-fields"><label>开始时间<input id="range-start" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>结束时间<input id="range-end" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>采样密度<select id="interval"><option value="500">2 帧 / 秒 · 快速</option><option value="250" selected>4 帧 / 秒 · 标准</option><option value="100">10 帧 / 秒 · 精细</option></select></label></div><div class="scan-options"><label class="check"><input id="refine" type="checkbox" checked>精修变化边界</label><label class="confidence-control">最低识别置信度<input id="confidence" type="number" value="0.75" min="0.1" max="0.99" step="0.05"></label></div><p class="hint">精修在已发现的变化附近以 50 ms 采样；短于采样间隔的字幕仍可能漏检。</p></section></div>
+<section class="scan-section"><div class="settings-heading"><h2><span class="step">02</span>识别范围</h2><button id="whole-video" class="quiet">整段视频</button></div><div class="scan-fields"><label>开始时间<input id="range-start" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>结束时间<input id="range-end" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>采样密度<select id="interval"><option value="500">2 帧 / 秒 · 快速</option><option value="250" selected>4 帧 / 秒 · 标准</option><option value="100">10 帧 / 秒 · 精细</option></select></label></div><div class="scan-options"><label class="check" title="WebGPU 将相同尺寸的裁图两张一组处理；关闭可对照单张速度。"><input id="batch-ocr" type="checkbox" checked>批量加速</label><label class="check"><input id="refine" type="checkbox" checked>精修变化边界</label><label class="confidence-control">最低识别置信度<input id="confidence" type="number" value="0.75" min="0.1" max="0.99" step="0.05"></label></div><p class="hint">精修在已发现的变化附近以 50 ms 采样；短于采样间隔的字幕仍可能漏检。</p></section></div>
 <div class="run-bar"><div><p id="run-status" role="status">选择视频并加载模型后开始。</p><span id="run-detail" class="hint">建议先识别 30–60 秒，确认字幕区域和效果。</span></div><button id="cancel" class="secondary" hidden>停止</button><button id="extract" class="primary">${playIcon}开始提取</button></div><progress id="progress" value="0" max="1" aria-label="提取进度"></progress>
 </section><aside class="timeline-panel"><div class="timeline-heading"><div><span class="eyebrow">TIMELINE / 字幕时间轴</span><h2><span id="cue-count">0</span> 条字幕</h2></div><label class="quiet file-action import-action">导入 JSON<input id="import-json" type="file" accept=".json"></label></div><div class="timeline-summary"><span id="review-count">0 条待复核</span><span id="timeline-duration" class="mono">00:00:00.000</span></div><canvas id="timeline" height="48" aria-label="字幕分布，点击跳转"></canvas><div class="list-tools"><input id="search" type="search" placeholder="搜索字幕…" aria-label="搜索字幕"><label class="check"><input id="review-only" type="checkbox">待复核</label></div><div id="cue-list" class="cue-list"><div class="timeline-empty"><span class="empty-number">Aa</span><p>识别后的字幕会显示在这里</p><span>点击时间跳转 · 编辑文本与起止时间</span></div></div><div class="timeline-footer"><div class="export-actions"><button data-export="srt" class="secondary">导出 SRT</button><button data-export="vtt" class="secondary">WebVTT</button><button data-export="json" class="secondary">JSON</button></div><div class="footer-actions"><button id="add-cue" class="quiet">＋ 添加字幕</button><button id="clear-cues" class="quiet">清空时间轴</button></div></div></aside></main>
 <div id="toast" class="toast" role="alert" hidden></div>
@@ -32,6 +34,7 @@ $('third-party-notices').textContent = `Sub Extract\n===========\n\n${projectLic
 const video = $<HTMLVideoElement>('video');
 const stage = $('video-stage');
 const cueList = $('cue-list');
+const profiling = new URLSearchParams(location.search).get('profile') === '1';
 function readSavedRegion(): Region {
   try {
     const saved = JSON.parse(localStorage.getItem('sub-extract-region') || 'null') as Region | null;
@@ -81,10 +84,16 @@ function toast(message: string, error = false) {
   clearTimeout(toastTimer); toastTimer = window.setTimeout(() => { element.hidden = true; }, error ? 9000 : 4000);
 }
 function disposeEngine() { engine?.dispose(); engine = undefined; }
+function invalidateFailedEngine() {
+  if (!engine?.isDisposed) return;
+  engineReady = false; disposeEngine();
+  $('model-status').textContent = '识别模型已停止，请重新加载模型。';
+  $('backend-badge').textContent = '待加载';
+}
 function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
 function refreshControls() {
   const locked = Boolean(busy);
-  for (const id of ['load-online', 'load-local', 'backend', 'detector-file', 'recognizer-file', 'dictionary-file', 'video-file', 'video-file-empty', 'import-json', 'select-region', 'reset-region', 'full-region', 'range-start', 'range-end', 'interval', 'confidence', 'refine', 'whole-video', 'clear-cache', 'clear-cues', 'add-cue']) ($<HTMLInputElement>(id)).disabled = locked;
+  for (const id of ['load-online', 'load-local', 'backend', 'detector-file', 'recognizer-file', 'dictionary-file', 'video-file', 'video-file-empty', 'import-json', 'select-region', 'reset-region', 'full-region', 'range-start', 'range-end', 'interval', 'confidence', 'refine', 'batch-ocr', 'whole-video', 'clear-cache', 'clear-cues', 'add-cue']) ($<HTMLInputElement>(id)).disabled = locked;
   const onlineButton = $<HTMLButtonElement>('load-online');
   onlineButton.disabled = locked || (engineReady && modelMode === 'online');
   onlineButton.textContent = busy === 'model' && modelMode === 'online' ? '加载模型中…' : engineReady && modelMode === 'online' ? '模型已就绪' : engineReady && modelMode === 'local' ? '切换到预设模型' : cachedModels ? '加载缓存模型' : '下载并加载模型';
@@ -257,7 +266,7 @@ async function loadModel(mode: 'online' | 'local') {
     $('model-status').textContent = `初始化 ${preferred === 'webgpu' ? 'WebGPU' : 'WASM'} 模型…`;
     let fallback = '';
     const initialize = async (backend: string) => {
-      engine = new OcrEngine();
+      engine = new OcrEngine(profiling);
       return engine.init({ detector: models.detector.slice(0), recognizer: models.recognizer.slice(0), dictionary: models.dictionary }, backend);
     };
     let result;
@@ -295,7 +304,7 @@ $('video-scrub').oninput = e => { seekTo(Number((e.target as HTMLInputElement).v
 $('mute-video').onclick = () => { video.muted = !video.muted; $('mute-video').textContent = video.muted ? '取消静音' : '静音'; };
 
 function minConfidence() { const value = Number($<HTMLInputElement>('confidence').value); if (!Number.isFinite(value) || value < 0.1 || value > 0.99) throw new Error('最低置信度应在 0.1–0.99 之间。'); return value; }
-function observation(result: OcrResult, time: number): Observation {
+function observation(result: OcrTextResult, time: number): Observation {
   return { time, text: result.text, confidence: result.confidence, lines: result.lines.map(line => ({ ...line, box: { x: region.x + line.box.x * region.width, y: region.y + line.box.y * region.height, width: line.box.width * region.width, height: line.box.height * region.height } })) };
 }
 $('test-frame').onclick = async () => {
@@ -306,9 +315,10 @@ $('test-frame').onclick = async () => {
     const result = await engine.recognize(await cropFrame(video, region), minConfidence());
     $('frame-result').hidden = false; $('frame-text').textContent = result.text || '未检测到符合置信度的文字，尝试调整区域或降低阈值。';
     $('frame-timing').textContent = `${Math.round(result.elapsed)} ms${result.text ? ' · ' + (result.confidence * 100).toFixed(0) + '%' : ''}`;
-  } catch (error) { if (engineReady) toast(message(error), true); }
+  } catch (error) { if (engineReady) toast(message(error), true); invalidateFailedEngine(); }
   finally { busy = undefined; $('run-status').textContent = engineReady ? '已就绪，可以开始提取。' : '请重新加载模型。'; refreshControls(); }
 };
+$('batch-ocr').onchange = () => { try { localStorage.setItem('sub-extract-batch', String($<HTMLInputElement>('batch-ocr').checked)); } catch { /* Use current selection without storage. */ } };
 $('whole-video').onclick = () => { $<HTMLInputElement>('range-start').value = formatTime(0); $<HTMLInputElement>('range-end').value = formatTime(video.duration * 1000 || 0); };
 
 async function extract() {
@@ -319,50 +329,127 @@ async function extract() {
   if (project?.cues.length && !confirm('重新提取将替换当前时间轴。请先导出 JSON 保存修改。继续？')) return;
   busy = 'scan'; active = new AbortController(); const signal = active.signal; video.pause(); setCropMode(false); observations = [];
   project = { schemaVersion: 1, timeUnit: 'ms', source: { name: source.name, duration: Math.round(video.duration * 1000), width: video.videoWidth, height: video.videoHeight }, extraction: { region: { ...region }, start, end, sampleInterval: interval, backend: engineBackend, model: engineModel, complete: false }, cues: [] };
-  const started = performance.now(); let lastRender = 0, refineCount = 0;
+  const started = performance.now(); let lastRender = 0, refineCount = 0, coarseCount = 0, coarseComplete = false;
+  const batchEnabled = engineBackend === 'webgpu' && $<HTMLInputElement>('batch-ocr').checked;
+  let batchFallback = false;
+  const modeLabel = () => batchEnabled ? batchFallback ? '批量加速 · 部分模型使用单张' : '批量加速' : '单张处理';
+  const metrics = profiling ? new PerformanceTotals() : undefined;
+  const samplingTimings = (): SamplingTimings | undefined => metrics ? { submittedFrames: 0, decodedFrames: 0, selectedFrames: 0, readMs: 0, queueWaitMs: 0, consumerMs: 0, wallMs: 0 } : undefined;
+  const recordSampling = (phase: string, values: SamplingTimings | undefined) => {
+    if (!values || !metrics) return;
+    for (const [key, value] of Object.entries(values)) {
+      if (key.endsWith('Ms')) metrics.add(`${phase}.${key}`, value); else metrics.count(`${phase}.${key}`, value);
+    }
+  };
+  const recordOcr = (result: OcrResult | OcrWindowResult, phase: string, roundTrip: number) => {
+    if (!metrics) return;
+    metrics.add(`${phase}.workerMs`, roundTrip);
+    metrics.add(`${phase}.workerOverheadMs`, Math.max(0, roundTrip - result.elapsed));
+    metrics.add(`${phase}.ocrMs`, result.elapsed);
+    for (const [key, value] of Object.entries(result.timings || {})) {
+      if (key.endsWith('Ms')) metrics.add(`${phase}.${key}`, value); else metrics.count(`${phase}.${key}`, value);
+    }
+    for (const [key, value] of Object.entries(result.counts || {})) metrics.count(`${phase}.${key}`, value);
+  };
+  const queueFor = (phase: 'coarse' | 'refine', accept: (result: OcrTextResult, time: number) => void) => {
+    const queue = new OcrCropQueue<ImageBitmap>(batchEnabled ? OCR_WINDOW_FRAMES : 1, signal, async items => {
+      const workerStarted = performance.now();
+      try {
+        if (batchEnabled) {
+          const result = await engine!.recognizeWindow(items.map(item => item.bitmap), confidence);
+          batchFallback ||= result.fallback;
+          recordOcr(result, phase, performance.now() - workerStarted);
+          result.values.forEach((value, i) => accept(value, items[i].time));
+        } else {
+          const result = await engine!.recognize(items[0].bitmap, confidence);
+          recordOcr(result, phase, performance.now() - workerStarted);
+          accept(result, items[0].time);
+        }
+      } finally { items.forEach(item => item.bitmap.close()); }
+      // Keep a completed in-flight window even when Stop was pressed during OCR.
+      signal.throwIfAborted();
+    });
+    return { queue, consume: async (frame: VideoFrame, time: number) => {
+      signal.throwIfAborted();
+      const cropStarted = metrics ? performance.now() : 0;
+      const bitmap = await cropFrame(frame, region);
+      if (metrics) metrics.add(`${phase}.cropMs`, performance.now() - cropStarted);
+      await queue.add(bitmap, time);
+    } };
+  };
   const displayProgress = (time: number, phase: string, value: number) => {
     $<HTMLProgressElement>('progress').value = value;
     $('run-status').textContent = `${phase} · ${formatTime(time)}`;
-    $('run-detail').textContent = `${observations.length} 个采样帧${refineCount ? ' + ' + refineCount + ' 个边界帧' : ''} · 已用 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()}`;
+    $('run-detail').textContent = `${coarseCount} 个采样帧${refineCount ? ' + ' + refineCount + ' 个边界帧' : ''} · 已用 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()} · ${modeLabel()}`;
   };
   renderCues(); refreshControls();
+  $<HTMLProgressElement>('progress').value = 0;
+  $('run-detail').textContent = `准备提取 · ${engineBackend.toUpperCase()} · ${modeLabel()}`;
   try {
     $('run-status').textContent = '读取视频索引…';
+    const indexStarted = metrics ? performance.now() : 0;
     metadata ||= await readMetadata(source, signal);
-    await sampleVideo(source, metadata, { start, end, interval }, signal, async (frame, time) => {
-      signal.throwIfAborted();
-      const result = await engine!.recognize(await cropFrame(frame, region), confidence); observations.push(observation(result, time));
+    if (metrics) metrics.add('metadataMs', performance.now() - indexStarted);
+    const coarseTimings = samplingTimings();
+    const coarse = queueFor('coarse', (result, time) => {
+      observations.push(observation(result, time)); coarseCount++;
       displayProgress(time, '识别字幕', ((time - start) / (end - start)) * ($<HTMLInputElement>('refine').checked ? 0.85 : 1));
-      if (performance.now() - lastRender > 1000) { project!.cues = buildCues(observations, start, Math.min(end, time + interval / 2), interval); renderCues(); lastRender = performance.now(); }
+      if (performance.now() - lastRender > 1000) {
+        const renderStarted = metrics ? performance.now() : 0;
+        project!.cues = buildCues(observations, start, Math.min(end, time + interval / 2), interval);
+        renderCues(); lastRender = performance.now();
+        if (metrics) metrics.add('renderMs', lastRender - renderStarted);
+      }
     });
+    try {
+      await sampleVideo(source, metadata, { start, end, interval }, signal, coarse.consume, coarseTimings);
+      await coarse.queue.flush(); coarseComplete = true;
+    } finally { coarse.queue.dispose(); recordSampling('coarse', coarseTimings); }
     if ($<HTMLInputElement>('refine').checked) {
       const windows: { start: number; end: number }[] = [];
       for (let i = 1; i < observations.length; i++) if (normalizeText(observations[i - 1].text) !== normalizeText(observations[i].text)) {
         const window = { start: observations[i - 1].time, end: observations[i].time };
         const previous = windows.at(-1); if (previous && window.start <= previous.end) previous.end = window.end; else windows.push(window);
       }
-      const refined: Observation[] = []; const existingTimes = new Set(observations.map(o => Math.round(o.time)));
-      for (let i = 0; i < windows.length; i++) {
-        signal.throwIfAborted(); const window = windows[i];
-        await sampleVideo(source, metadata, { start: window.start, end: window.end + 1, interval: 50 }, signal, async (frame, time) => {
+      const existingTimes = new Set(observations.map(o => Math.round(o.time)));
+      const refineTimings = samplingTimings();
+      const refine = queueFor('refine', (result, time) => {
+        observations.push(observation(result, time)); refineCount++;
+        displayProgress(time, '精修字幕边界', 0.85 + 0.15 * clamp((time - start) / (end - start), 0, 1));
+      });
+      try {
+        await sampleVideoWindows(source, metadata, windows.map(window => ({ start: window.start, end: window.end + 1, interval: 50 })), signal, async (frame, time) => {
           if (existingTimes.has(Math.round(time))) return;
-          const result = await engine!.recognize(await cropFrame(frame, region), confidence); refined.push(observation(result, time)); existingTimes.add(Math.round(time)); refineCount++;
-          displayProgress(time, '精修字幕边界', 0.85 + 0.15 * (i + 1) / Math.max(1, windows.length));
-        });
-      }
-      observations.push(...refined); observations.sort((a, b) => a.time - b.time);
+          existingTimes.add(Math.round(time));
+          await refine.consume(frame, time);
+        }, refineTimings);
+        await refine.queue.flush();
+      } finally { refine.queue.dispose(); recordSampling('refine', refineTimings); }
+      observations.sort((a, b) => a.time - b.time);
     }
     project.cues = buildCues(observations, start, end, interval); project.extraction.complete = true;
     $<HTMLProgressElement>('progress').value = 1;
     $('run-status').textContent = `提取完成 · ${project.cues.length} 条字幕`;
-    $('run-detail').textContent = `${observations.length} 个采样帧 · 用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()}${project.cues.length ? ' · 请复核识别文本和时间。' : ' · 未识别到字幕，请调整区域或阈值。'}`;
+    $('run-detail').textContent = `${observations.length} 个采样帧 · 用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()} · ${modeLabel()}${project.cues.length ? ' · 请复核识别文本和时间。' : ' · 未识别到字幕，请调整区域或阈值。'}`;
   } catch (error) {
-    const processedEnd = observations.length ? Math.min(end, observations.at(-1)!.time + interval / 2) : start;
+    invalidateFailedEngine();
+    observations.sort((a, b) => a.time - b.time);
+    const processedEnd = coarseComplete ? end : observations.length ? Math.min(end, observations.at(-1)!.time + interval / 2) : start;
     project.extraction.end = processedEnd; project.cues = buildCues(observations, start, processedEnd, interval);
     $('run-status').textContent = signal.aborted ? `已停止 · 保留 ${project.cues.length} 条字幕` : '提取失败，已保留已识别结果。';
     $('run-detail').textContent = signal.aborted ? '可复核并导出已有结果。重新开始会替换时间轴。' : message(error);
     if (!signal.aborted) toast(message(error), true);
-  } finally { busy = undefined; active = undefined; renderCues(); refreshControls(); }
+  } finally {
+    busy = undefined; active = undefined; renderCues(); refreshControls();
+    if (metrics) {
+      metrics.add('totalMs', performance.now() - started);
+      const report = { backend: engineBackend, batchEnabled, batchFallback, complete: project.extraction.complete, ...metrics.snapshot(), notes: 'Sampling wall/consumer/queue times overlap. WebGPU Run measures dispatch; Output includes waiting for GPU completion and download. Profiling changes output scheduling. No pure GPU kernel or transfer duration is claimed.' };
+      let element = document.getElementById('performance-report');
+      if (!element) { element = document.createElement('script'); element.id = 'performance-report'; (element as HTMLScriptElement).type = 'application/json'; document.body.append(element); }
+      element.textContent = JSON.stringify(report);
+      console.info('Sub Extract performance', report);
+    }
+  }
 }
 $('extract').onclick = () => void extract();
 $('cancel').onclick = () => {
@@ -476,6 +563,7 @@ $('help').onclick = () => $<HTMLDialogElement>('help-dialog').showModal();
 $('close-help').onclick = () => $<HTMLDialogElement>('help-dialog').close();
 $('help-dialog').onclick = event => { if (event.target === $('help-dialog')) $<HTMLDialogElement>('help-dialog').close(); };
 window.addEventListener('beforeunload', event => { if (busy || project?.cues.length) { event.preventDefault(); } });
+try { const batch = localStorage.getItem('sub-extract-batch'); if (batch !== null) $<HTMLInputElement>('batch-ocr').checked = batch !== 'false'; } catch { /* Use batch acceleration by default. */ }
 try { const preferred = localStorage.getItem('sub-extract-backend'); if (preferred && ['auto', 'webgpu', 'wasm'].includes(preferred)) $<HTMLSelectElement>('backend').value = preferred; } catch { /* Use the default backend. */ }
 setupPwa(toast);
 updateRegion(); refreshControls();
