@@ -1,3 +1,4 @@
+import { parseColorFilter, type ColorFilterOptions } from './color-filter';
 export interface Region { x: number; y: number; width: number; height: number }
 export interface OcrLine { text: string; confidence: number; box: Region; spacingInferred?: boolean; edgeFiltered?: boolean }
 export interface Observation { time: number; text: string; confidence: number; lines: OcrLine[]; ocrTime?: number }
@@ -7,7 +8,7 @@ export interface Cue {
 }
 export interface Project {
   schemaVersion: 1; timeUnit: 'ms'; source: { name: string; duration: number; width: number; height: number };
-  extraction: { region: Region; start: number; end: number; sampleInterval: number; backend: string; model: string; complete: boolean };
+  extraction: { region: Region; start: number; end: number; sampleInterval: number; backend: string; model: string; complete: boolean; ignoreClippedText?: boolean; colorFilter?: ColorFilterOptions };
   cues: Cue[];
 }
 export const DEFAULT_REGION: Region = { x: 0.1, y: 0.82, width: 0.8, height: 0.15 };
@@ -210,6 +211,12 @@ export function importProject(value: unknown): Project {
     cue.lines = cue.text.split('\n'); cue.needsReview = Boolean(cue.needsReview);
   }
   const error = validateCues(p.cues); if (error) throw new Error(error);
+  if (p.extraction.ignoreClippedText !== undefined && typeof p.extraction.ignoreClippedText !== 'boolean') throw new Error('JSON 裁边文字过滤设置无效。');
+  if (p.extraction.colorFilter !== undefined) {
+    const filter = parseColorFilter(p.extraction.colorFilter);
+    if (!filter) throw new Error('JSON 字幕颜色过滤设置无效。');
+    p.extraction.colorFilter = filter;
+  }
   const r = p.extraction.region;
   if (!r || ![r.x, r.y, r.width, r.height].every(Number.isFinite) || r.x < 0 || r.y < 0 || r.width <= 0 || r.height <= 0 || r.x + r.width > 1.001 || r.y + r.height > 1.001) throw new Error('JSON 字幕区域无效。');
   if (![p.source.duration, p.source.width, p.source.height, p.extraction.start, p.extraction.end, p.extraction.sampleInterval].every(Number.isFinite) || p.extraction.start < 0 || p.extraction.end <= p.extraction.start || p.extraction.sampleInterval <= 0) throw new Error('JSON 时间或视频信息无效。');

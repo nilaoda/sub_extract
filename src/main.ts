@@ -9,6 +9,8 @@ import { MODEL_NAME, MODEL_FILES, downloadModels, localModels, clearModelCache, 
 import { readMetadata, sampleVideo, sampleVideoWindows, cropFrame, type VideoMetadata, type SamplingTimings } from './video';
 import { PerformanceTotals } from './performance';
 import { OcrCropQueue, OCR_WINDOW_FRAMES } from './ocr-batch';
+import { ColorMaskReader, ColorEmptyGate } from './color-filter';
+import { setupColorFilter } from './color-filter-ui';
 
 const icon = (path: string) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">${path}</svg>`;
 const uploadIcon = icon('<path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/>');
@@ -22,6 +24,8 @@ document.querySelector('#app')!.innerHTML = `
 <div class="video-caption"><span id="video-name">尚未选择视频</span><span id="video-info">—</span></div>
 <div class="crop-toolbar"><button id="select-region" class="secondary">${cropIcon}框选字幕</button><button id="reset-region" class="quiet">底部区域</button><button id="full-region" class="quiet">整幅画面</button><span id="region-info" class="mono" title="拖动字幕框移动，拖动角点缩放，靠近画面中心自动吸附">—</span><button id="test-frame" class="quiet">识别当前帧</button></div>
 <div id="frame-result" class="frame-result" hidden><span class="eyebrow">当前帧</span><span id="frame-text"></span><span id="frame-timing" class="mono"></span></div>
+<div class="clipped-text-filter"><label class="check"><input id="ignore-clipped-text" type="checkbox">忽略被字幕框上下边缘截断的文字</label><p class="hint">用于排除裁进字幕区域的片头名单等文字。字幕框请留足上下边距，避免过滤正常字幕；框内完整文字仍会识别。</p></div>
+<details id="color-filter" class="color-filter" open></details>
 <div class="settings"><section class="model-section"><div class="settings-heading"><h2><span class="step">01</span>识别模型</h2><span id="backend-badge" class="badge">${navigator.gpu ? 'WebGPU 可用' : 'WASM 可用'}</span></div><div class="model-row"><div><strong>${MODEL_NAME}</strong><p>中英文 · 检测 + 识别 + 字典 · 约 15.7 MB</p></div><button id="load-online" class="secondary">下载并加载模型</button></div><div class="backend-row"><label>推理方式<select id="backend"><option value="auto">自动 · 优先 WebGPU</option><option value="webgpu">WebGPU</option><option value="wasm">WASM · CPU</option></select></label><button id="clear-cache" class="quiet">清除模型缓存</button></div><details id="local-models"><summary>使用本地模型文件</summary><p class="hint">支持 PP-OCRv4 / v5 兼容模型，字典须与识别模型配套；预设组合使用 v4 字典。</p><div class="local-files"><label>检测模型<input id="detector-file" type="file" accept=".onnx"></label><label>识别模型<input id="recognizer-file" type="file" accept=".onnx"></label><label>字符字典<input id="dictionary-file" type="file" accept=".txt"></label></div><div class="local-model-footer"><button id="load-local" class="secondary">加载所选文件</button><span class="hint">示例文件：${MODEL_FILES.map(m => `<a href="${m.url}" target="_blank" rel="noreferrer">${m.name}</a>`).join(' · ')}</span></div></details><p id="model-status" class="status-text" role="status">加载一次即可识别；在线模型会缓存在当前浏览器。</p></section>
 <section class="scan-section"><div class="settings-heading"><h2><span class="step">02</span>识别范围</h2><button id="whole-video" class="quiet">整段视频</button></div><div class="scan-fields"><label>开始时间<input id="range-start" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>结束时间<input id="range-end" type="text" value="00:00:00.000" spellcheck="false" inputmode="decimal"></label><label>采样密度<select id="interval"><option value="500">2 帧 / 秒 · 快速</option><option value="250" selected>4 帧 / 秒 · 标准</option><option value="100">10 帧 / 秒 · 精细</option></select></label></div><div class="scan-options"><label class="check" title="WebGPU 将相同尺寸的裁图两张一组处理；关闭可对照单张速度。"><input id="batch-ocr" type="checkbox" checked>批量加速</label><label class="check" title="笔画相似且两次识别一致时复用结果，定期重新识别；取消勾选可对照效果。"><input id="deduplicate" type="checkbox" checked>画面去重</label><label class="check"><input id="refine" type="checkbox" checked>精修变化边界</label><label class="confidence-control">最低识别置信度<input id="confidence" type="number" value="0.75" min="0.1" max="0.99" step="0.05"></label></div><p class="hint">精修在已发现的变化附近以 50 ms 采样；短于采样间隔的字幕仍可能漏检。</p></section></div>
 <div class="run-bar"><div><p id="run-status" role="status">选择视频并加载模型后开始。</p><span id="run-detail" class="hint">建议先识别 30–60 秒，确认字幕区域和效果。</span></div><button id="cancel" class="secondary" hidden>停止</button><button id="extract" class="primary">${playIcon}开始提取</button></div><progress id="progress" value="0" max="1" aria-label="提取进度"></progress>
@@ -48,6 +52,7 @@ function readSavedRegion(): Region {
 }
 function rememberRegion() {
   try { localStorage.setItem('sub-extract-region', JSON.stringify(region)); } catch { /* Region editing still works without storage. */ }
+  void colorFilterUi.preview();
 }
 let source: File | undefined;
 let sourceURL: string | undefined;
@@ -65,11 +70,13 @@ let scanCounter = 0;
 let cropMode = false, currentCueId = '', toastTimer = 0;
 let previewSeek: AbortController | undefined;
 let pendingSeek: Promise<void> = Promise.resolve();
+const colorFilterUi = setupColorFilter(video, stage, () => region, () => pendingSeek, () => { cancelDrag(); setCropMode(false); }, toast);
 function seekTo(timeMs: number, frameTimeMs?: number) {
+  colorFilterUi.stopPicking();
   previewSeek?.abort();
   const controller = new AbortController(); previewSeek = controller;
   pendingSeek = seekPreview(video, timeMs, controller.signal, frameTimeMs).then(() => {
-    if (!controller.signal.aborted) updatePlaybackPosition();
+    if (!controller.signal.aborted) { updatePlaybackPosition(); void colorFilterUi.preview(); }
   });
   void pendingSeek.catch(error => { if (!controller.signal.aborted) toast(message(error), true); });
 }
@@ -95,7 +102,8 @@ function invalidateFailedEngine() {
 function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
 function refreshControls() {
   const locked = Boolean(busy);
-  for (const id of ['load-online', 'load-local', 'backend', 'detector-file', 'recognizer-file', 'dictionary-file', 'video-file', 'video-file-empty', 'import-json', 'select-region', 'reset-region', 'full-region', 'range-start', 'range-end', 'interval', 'confidence', 'refine', 'batch-ocr', 'deduplicate', 'whole-video', 'clear-cache', 'clear-cues', 'add-cue']) ($<HTMLInputElement>(id)).disabled = locked;
+  colorFilterUi.refresh(locked, Boolean(source));
+  for (const id of ['load-online', 'load-local', 'backend', 'detector-file', 'recognizer-file', 'dictionary-file', 'video-file', 'video-file-empty', 'import-json', 'select-region', 'reset-region', 'full-region', 'range-start', 'range-end', 'interval', 'confidence', 'refine', 'batch-ocr', 'deduplicate', 'ignore-clipped-text', 'whole-video', 'clear-cache', 'clear-cues', 'add-cue']) ($<HTMLInputElement>(id)).disabled = locked;
   const onlineButton = $<HTMLButtonElement>('load-online');
   onlineButton.disabled = locked || (engineReady && modelMode === 'online');
   onlineButton.textContent = busy === 'model' && modelMode === 'online' ? '加载模型中…' : engineReady && modelMode === 'online' ? '模型已就绪' : engineReady && modelMode === 'local' ? '切换到预设模型' : modelCacheState === 'ready' ? '加载缓存模型' : modelCacheState === 'upgrade' ? '更新并加载模型' : '下载并加载模型';
@@ -126,6 +134,7 @@ async function loadVideo(file: File) {
   previewSeek?.abort();
   pendingSeek = Promise.resolve();
   if (sourceURL) URL.revokeObjectURL(sourceURL);
+  colorFilterUi.sourceChanged();
   source = file; metadata = undefined; sourceURL = URL.createObjectURL(file); $('frame-result').hidden = true;
   video.src = sourceURL; $('video-empty').hidden = true; stage.classList.add('has-video');
   $('video-name').textContent = file.name; $('video-info').textContent = '读取视频…';
@@ -185,7 +194,7 @@ document.addEventListener('drop', event => { if (isFileDrag(event)) { event.prev
 window.addEventListener('dragend', clearFileDrag);
 window.addEventListener('blur', clearFileDrag);
 
-$('select-region').onclick = () => { if (!source) return toast('请先选择视频。'); setCropMode(!cropMode); };
+$('select-region').onclick = () => { if (!source) return toast('请先选择视频。'); colorFilterUi.stopPicking(); setCropMode(!cropMode); };
 $('reset-region').onclick = () => { region = { ...DEFAULT_REGION }; rememberRegion(); updateRegion(); setCropMode(false); };
 $('full-region').onclick = () => { region = { x: 0, y: 0, width: 1, height: 1 }; rememberRegion(); updateRegion(); setCropMode(false); };
 interface CropDrag { x: number; y: number; old: Region; pointerId: number; mode: 'select' | 'move' | 'resize' | 'center'; corner?: CropCorner; axis?: 'x' | 'y' }
@@ -314,13 +323,17 @@ $('test-frame').onclick = async () => {
   busy = 'frame'; video.pause(); refreshControls();
   try {
     await pendingSeek;
-    const result = await engine.recognize(await cropFrame(video, region), minConfidence());
-    $('frame-result').hidden = false; $('frame-text').textContent = result.text || '未检测到符合置信度的文字，尝试调整区域或降低阈值。';
-    $('frame-timing').textContent = `${Math.round(result.elapsed)} ms${result.text ? ' · ' + (result.confidence * 100).toFixed(0) + '%' : ''}`;
+    const result = await engine.recognize(await cropFrame(video, region), minConfidence(), $<HTMLInputElement>('ignore-clipped-text').checked);
+    $('frame-result').hidden = false; $('frame-text').textContent = result.text || (result.ignoredTextBoxes ? '已过滤被字幕框边缘截断的文字，未识别到其他字幕。' : '未检测到符合置信度的文字，尝试调整区域或降低阈值。');
+    $('frame-timing').textContent = `${Math.round(result.elapsed)} ms${result.text ? ' · ' + (result.confidence * 100).toFixed(0) + '%' : ''}${result.ignoredTextBoxes ? ` · 裁边过滤 ${result.ignoredTextBoxes} 框` : ''}`;
   } catch (error) { if (engineReady) toast(message(error), true); invalidateFailedEngine(); }
   finally { busy = undefined; $('run-status').textContent = engineReady ? '已就绪，可以开始提取。' : '请重新加载模型。'; refreshControls(); }
 };
 $('deduplicate').onchange = () => { try { localStorage.setItem('sub-extract-deduplicate', String($<HTMLInputElement>('deduplicate').checked)); } catch { /* Use current selection without storage. */ } };
+$('ignore-clipped-text').onchange = () => {
+  $('frame-result').hidden = true;
+  try { localStorage.setItem('sub-extract-ignore-clipped-text', String($<HTMLInputElement>('ignore-clipped-text').checked)); } catch { /* Use current selection without storage. */ }
+};
 $('batch-ocr').onchange = () => { try { localStorage.setItem('sub-extract-batch', String($<HTMLInputElement>('batch-ocr').checked)); } catch { /* Use current selection without storage. */ } };
 $('whole-video').onclick = () => { $<HTMLInputElement>('range-start').value = formatTime(0); $<HTMLInputElement>('range-end').value = formatTime(video.duration * 1000 || 0); };
 
@@ -335,7 +348,11 @@ async function extract() {
   const started = performance.now(); let lastRender = 0, refineCount = 0, coarseCount = 0, coarseComplete = false;
   const batchEnabled = engineBackend === 'webgpu' && $<HTMLInputElement>('batch-ocr').checked;
   const deduplicate = $<HTMLInputElement>('deduplicate').checked, scanId = ++scanCounter;
-  let batchFallback = false, reusedFrames = 0, ocrFrames = 0;
+  const ignoreClippedText = $<HTMLInputElement>('ignore-clipped-text').checked;
+  project.extraction.ignoreClippedText = ignoreClippedText;
+  const colorFilter = colorFilterUi.options(), colorReader = colorFilter ? new ColorMaskReader() : undefined;
+  if (colorFilter) project.extraction.colorFilter = colorFilter;
+  let batchFallback = false, reusedFrames = 0, ocrFrames = 0, skippedFrames = 0, ignoredTextBoxes = 0, colorMismatch = false;
   const modeLabel = () => batchEnabled ? batchFallback ? '批量加速 · 部分模型使用单张' : '批量加速' : '单张处理';
   const metrics = profiling ? new PerformanceTotals() : undefined;
   const samplingTimings = (): SamplingTimings | undefined => metrics ? { submittedFrames: 0, decodedFrames: 0, selectedFrames: 0, readMs: 0, queueWaitMs: 0, consumerMs: 0, wallMs: 0 } : undefined;
@@ -356,20 +373,29 @@ async function extract() {
     for (const [key, value] of Object.entries(result.counts || {})) metrics.count(`${phase}.${key}`, value);
   };
   const queueFor = (phase: 'coarse' | 'refine', accept: (result: OcrTextResult, time: number, ocrTime?: number) => void) => {
+    const filter = phase === 'coarse' ? colorFilter : undefined, gate = new ColorEmptyGate();
+    const matches = new Map<number, number>();
+    let segment = 0, forceProbe = false;
+    const record = (value: OcrTextResult, time: number, ocrTime?: number) => {
+      const count = matches.get(time); matches.delete(time);
+      if (count !== undefined) { gate.observe(count, time, value.text); colorMismatch ||= gate.disabled; }
+      ignoredTextBoxes += value.ignoredTextBoxes || 0;
+      accept(value, time, ocrTime);
+    };
     const queue = new OcrCropQueue<ImageBitmap>(batchEnabled ? OCR_WINDOW_FRAMES : 1, signal, async items => {
       const workerStarted = performance.now();
       try {
         if (batchEnabled || deduplicate) {
-          const result = await engine!.recognizeWindow(items.map(item => item.bitmap), confidence, { batch: batchEnabled, deduplicate, times: items.map(item => item.time), scope: `${scanId}:${phase}` });
+          const result = await engine!.recognizeWindow(items.map(item => item.bitmap), confidence, { ignoreClippedText, batch: batchEnabled, deduplicate: deduplicate && !forceProbe, times: items.map(item => item.time), scope: `${scanId}:${phase}:${segment}` });
           reusedFrames += result.reusedFrames || 0; ocrFrames += result.ocrFrames ?? items.length;
           if (metrics) { metrics.count(`${phase}.reusedFrames`, result.reusedFrames || 0); metrics.count(`${phase}.ocrFrames`, result.ocrFrames ?? items.length); if (result.signatureMs !== undefined) metrics.add(`${phase}.signatureMs`, result.signatureMs); }
           batchFallback ||= result.fallback;
           recordOcr(result, phase, performance.now() - workerStarted);
-          result.values.forEach((value, i) => accept(value, items[i].time, result.sourceTimes?.[i]));
+          result.values.forEach((value, i) => record(value, items[i].time, result.sourceTimes?.[i]));
         } else {
-          const result = await engine!.recognize(items[0].bitmap, confidence);
+          const result = await engine!.recognize(items[0].bitmap, confidence, ignoreClippedText);
           recordOcr(result, phase, performance.now() - workerStarted);
-          ocrFrames++; accept(result, items[0].time);
+          ocrFrames++; record(result, items[0].time);
         }
       } finally { items.forEach(item => item.bitmap.close()); }
       // Keep a completed in-flight window even when Stop was pressed during OCR.
@@ -380,17 +406,43 @@ async function extract() {
       const cropStarted = metrics ? performance.now() : 0;
       const bitmap = await cropFrame(frame, region);
       if (metrics) metrics.add(`${phase}.cropMs`, performance.now() - cropStarted);
-      await queue.add(bitmap, time);
+      let handedOff = false;
+      try {
+        if (filter && !gate.disabled) {
+          const filterStarted = metrics ? performance.now() : 0;
+          const count = colorReader!.read(bitmap, filter).count;
+          if (metrics) metrics.add(`${phase}.colorFilterMs`, performance.now() - filterStarted);
+          if (count === 0) {
+            // Settle earlier candidates before testing an empty gap. A skipped
+            // gap starts a new reuse scope, so identical text cannot bridge it.
+            await queue.flush(); signal.throwIfAborted();
+            if (gate.canSkip(count, time)) {
+              segment++; skippedFrames++; metrics?.count(`${phase}.skippedFrames`);
+              accept({ text: '', confidence: 0, lines: [] }, time);
+              return;
+            }
+            // Empty confirmation must use the model, including with reuse on.
+            segment++; forceProbe = true; matches.set(time, count);
+            try { handedOff = true; await queue.add(bitmap, time); await queue.flush(); }
+            finally { forceProbe = false; }
+            return;
+          }
+          matches.set(time, count);
+        }
+        handedOff = true; await queue.add(bitmap, time);
+      } finally { if (!handedOff) bitmap.close(); }
     } };
   };
+  const filterLabel = () => (colorFilter ? ` · 空帧跳过 ${skippedFrames} 帧${colorMismatch ? ' · 颜色不匹配，已停用过滤' : ''}` : '')
+    + (ignoreClippedText ? ` · 裁边过滤 ${ignoredTextBoxes} 框` : '');
   const displayProgress = (time: number, phase: string, value: number) => {
     $<HTMLProgressElement>('progress').value = value;
     $('run-status').textContent = `${phase} · ${formatTime(time)}`;
-    $('run-detail').textContent = `${coarseCount} 个采样帧${refineCount ? ' + ' + refineCount + ' 个边界帧' : ''} · 已用 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()} · ${modeLabel()}${deduplicate ? ` · OCR ${ocrFrames} 帧 / 复用 ${reusedFrames} 帧` : ''}`;
+    $('run-detail').textContent = `${coarseCount} 个采样帧${refineCount ? ' + ' + refineCount + ' 个边界帧' : ''} · 已用 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()} · ${modeLabel()}${deduplicate || colorFilter ? ` · OCR ${ocrFrames} 帧 / 复用 ${reusedFrames} 帧` : ''}${filterLabel()}`;
   };
   renderCues(); refreshControls();
   $<HTMLProgressElement>('progress').value = 0;
-  $('run-detail').textContent = `准备提取 · ${engineBackend.toUpperCase()} · ${modeLabel()}${deduplicate ? ` · OCR ${ocrFrames} 帧 / 复用 ${reusedFrames} 帧` : ''}`;
+  $('run-detail').textContent = `准备提取 · ${engineBackend.toUpperCase()} · ${modeLabel()}${deduplicate || colorFilter ? ` · OCR ${ocrFrames} 帧 / 复用 ${reusedFrames} 帧` : ''}${filterLabel()}`;
   try {
     $('run-status').textContent = '读取视频索引…';
     const indexStarted = metrics ? performance.now() : 0;
@@ -436,7 +488,7 @@ async function extract() {
     project.cues = buildCues(observations, start, end, interval); project.extraction.complete = true;
     $<HTMLProgressElement>('progress').value = 1;
     $('run-status').textContent = `提取完成 · ${project.cues.length} 条字幕`;
-    $('run-detail').textContent = `${observations.length} 个采样帧 · 用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()} · ${modeLabel()}${deduplicate ? ` · OCR ${ocrFrames} 帧 / 复用 ${reusedFrames} 帧` : ''}${project.cues.length ? ' · 请复核识别文本和时间。' : ' · 未识别到字幕，请调整区域或阈值。'}`;
+    $('run-detail').textContent = `${observations.length} 个采样帧 · 用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()} · ${modeLabel()}${deduplicate || colorFilter ? ` · OCR ${ocrFrames} 帧 / 复用 ${reusedFrames} 帧` : ''}${filterLabel()}${project.cues.length ? ' · 请复核识别文本和时间。' : ' · 未识别到字幕，请调整区域或阈值。'}`;
   } catch (error) {
     invalidateFailedEngine();
     observations.sort((a, b) => a.time - b.time);
@@ -449,7 +501,7 @@ async function extract() {
     busy = undefined; active = undefined; renderCues(); refreshControls();
     if (metrics) {
       metrics.add('totalMs', performance.now() - started);
-      const report = { backend: engineBackend, batchEnabled, batchFallback, deduplicate, reusedFrames, ocrFrames, complete: project.extraction.complete, ...metrics.snapshot(), notes: 'Sampling wall/consumer/queue times overlap. WebGPU Run measures dispatch; Output includes waiting for GPU completion and download. Profiling changes output scheduling. No pure GPU kernel or transfer duration is claimed.' };
+      const report = { backend: engineBackend, batchEnabled, batchFallback, deduplicate, reusedFrames, ocrFrames, colorFilter, skippedFrames, colorMismatch, ignoreClippedText, ignoredTextBoxes, complete: project.extraction.complete, ...metrics.snapshot(), notes: 'Sampling wall/consumer/queue times overlap. WebGPU Run measures dispatch; Output includes waiting for GPU completion and download. Profiling changes output scheduling. No pure GPU kernel or transfer duration is claimed.' };
       let element = document.getElementById('performance-report');
       if (!element) { element = document.createElement('script'); element.id = 'performance-report'; (element as HTMLScriptElement).type = 'application/json'; document.body.append(element); }
       element.textContent = JSON.stringify(report);
@@ -572,6 +624,7 @@ window.addEventListener('beforeunload', event => { if (busy || project?.cues.len
 try { const saved = localStorage.getItem('sub-extract-deduplicate'); if (saved !== null) $<HTMLInputElement>('deduplicate').checked = saved !== 'false'; } catch { /* Use frame deduplication by default. */ }
 try { const batch = localStorage.getItem('sub-extract-batch'); if (batch !== null) $<HTMLInputElement>('batch-ocr').checked = batch !== 'false'; } catch { /* Use batch acceleration by default. */ }
 try { const preferred = localStorage.getItem('sub-extract-backend'); if (preferred && ['auto', 'webgpu', 'wasm'].includes(preferred)) $<HTMLSelectElement>('backend').value = preferred; } catch { /* Use the default backend. */ }
+try { $<HTMLInputElement>('ignore-clipped-text').checked = localStorage.getItem('sub-extract-ignore-clipped-text') === 'true'; } catch { /* Filtering is opt-in. */ }
 setupPwa(toast);
 updateRegion(); refreshControls();
 void getModelCacheState().then(state => {

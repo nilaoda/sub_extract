@@ -208,6 +208,11 @@ test('time parsing handles hours and fractions and rejects out-of-range values',
 test('JSON roundtrip rejects incompatible schemas, missing metadata, and invalid regions', () => {
   const project = { schemaVersion: 1, timeUnit: 'ms', source: { name: 'video.mp4', duration: 10000, width: 1280, height: 720 }, extraction: { region: { x: 0, y: 0.8, width: 1, height: 0.2 }, start: 0, end: 10000, sampleInterval: 250, backend: 'webgpu', model: 'PP-OCRv4', complete: true }, cues: [cue] };
   assert.equal(importProject(JSON.parse(JSON.stringify(project))).cues[0].text, cue.text);
+  const filtered = { ...project, extraction: { ...project.extraction, colorFilter: { color: '#FFFFFF', tolerance: 60, outline: false } } };
+  assert.equal(importProject(filtered).extraction.colorFilter?.color, '#ffffff');
+  assert.equal(importProject({ ...project, extraction: { ...project.extraction, ignoreClippedText: true } }).extraction.ignoreClippedText, true);
+  assert.throws(() => importProject({ ...project, extraction: { ...project.extraction, ignoreClippedText: 'true' } }));
+  assert.throws(() => importProject({ ...project, extraction: { ...project.extraction, colorFilter: { color: '#fff' } } }));
   assert.throws(() => importProject({ ...project, timeUnit: 's' }));
   assert.throws(() => importProject({ ...project, extraction: { ...project.extraction, region: { x: 0.8, y: 0, width: 1, height: 1 } } }));
 });

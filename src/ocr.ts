@@ -3,10 +3,10 @@ import readRuntimeBase64 from 'virtual:ort-wasm';
 import type { OcrLine } from './core';
 import type { OcrTimings } from './performance';
 
-export interface OcrTextResult { text: string; confidence: number; lines: OcrLine[] }
+export interface OcrTextResult { text: string; confidence: number; lines: OcrLine[]; ignoredTextBoxes?: number }
 export interface OcrBatchCounts { detectorCalls: number; detectorBatch2: number; recognizerCalls: number; recognizerBatch2: number }
 export interface OcrResult extends OcrTextResult { elapsed: number; timings?: OcrTimings; counts?: OcrBatchCounts }
-export interface OcrWindowOptions { batch?: boolean; deduplicate?: boolean; times?: number[]; scope?: string }
+export interface OcrWindowOptions { ignoreClippedText?: boolean; batch?: boolean; deduplicate?: boolean; times?: number[]; scope?: string }
 export interface OcrWindowResult { values: OcrTextResult[]; elapsed: number; timings?: OcrTimings; counts: OcrBatchCounts; fallback: boolean; sourceTimes?: number[]; reusedFrames?: number; ocrFrames?: number; signatureMs?: number }
 export class OcrEngine {
   private worker = new OcrWorker();
@@ -47,8 +47,8 @@ export class OcrEngine {
     const wasm = await new Response(new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
     return this.call<{ backend: string; dictionarySize: number; gpu: string }>('init', { ...models, wasm, backend, profile: this.profile }, [wasm, models.detector, models.recognizer]);
   }
-  async recognize(bitmap: ImageBitmap, minConfidence: number) {
-    try { return await this.call<OcrResult>('recognize', { bitmap, minConfidence }, [bitmap]); }
+  async recognize(bitmap: ImageBitmap, minConfidence: number, ignoreClippedText = false) {
+    try { return await this.call<OcrResult>('recognize', { bitmap, minConfidence, ignoreClippedText }, [bitmap]); }
     finally { bitmap.close(); }
   }
   async recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, options: OcrWindowOptions = {}) {

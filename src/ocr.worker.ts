@@ -1,5 +1,6 @@
 import * as ort from 'onnxruntime-web/webgpu';
-import { decodeCTC, restoreVisualSpaces, filterUnsupportedEdgeTokens, outlinedTextProjection, clamp, mergeTextBoxes, type OcrLine, type Region } from './core';
+import { detectTextBoxes } from './text-detection';
+import { decodeCTC, restoreVisualSpaces, filterUnsupportedEdgeTokens, outlinedTextProjection, clamp, type OcrLine, type Region } from './core';
 import type { OcrTimings } from './performance';
 import { CompatibleBatchRunner, groupOcrJobs, OCR_WINDOW_FRAMES, OCR_WINDOW_BYTES } from './ocr-batch';
 import type { OcrBatchCounts, OcrWindowOptions, OcrWindowResult } from './ocr';
@@ -110,32 +111,14 @@ async function inputTensor(width: number, height: number, recognition: boolean, 
   return new ort.Tensor('float32', output, [1, 3, height, width]);
 }
 
-function findBoxes(probabilities: Float32Array, width: number, height: number): Region[] {
-  const visited = new Uint8Array(width * height), queue = new Int32Array(width * height), boxes: Region[] = [];
-  for (let index = 0; index < visited.length; index++) {
-    if (visited[index] || probabilities[index] < 0.3) continue;
-    let head = 0, tail = 1, score = 0, count = 0;
-    queue[0] = index; visited[index] = 1;
-    let x0 = width, y0 = height, x1 = 0, y1 = 0;
-    while (head < tail) {
-      const current = queue[head++], x = current % width, y = Math.floor(current / width);
-      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
-      score += probabilities[current]; count++;
-      for (const neighbor of [x ? current - 1 : -1, x + 1 < width ? current + 1 : -1, y ? current - width : -1, y + 1 < height ? current + width : -1]) {
-        if (neighbor >= 0 && !visited[neighbor] && probabilities[neighbor] >= 0.3) { visited[neighbor] = 1; queue[tail++] = neighbor; }
-      }
-    }
-    const w = x1 - x0 + 1, h = y1 - y0 + 1;
-    if (count < 6 || w < 3 || h < 2 || score / count < 0.55) continue;
-    // DB's contour expansion, approximated for horizontal subtitle rectangles.
-    const margin = Math.max(2, w * h * 1.6 / (2 * (w + h)));
-    const left = clamp(x0 - margin, 0, width), top = clamp(y0 - margin, 0, height);
-    boxes.push({ x: left / width, y: top / height, width: (clamp(x1 + margin + 1, 0, width) - left) / width, height: (clamp(y1 + margin + 1, 0, height) - top) / height });
-  }
-  return boxes.sort((a, b) => a.y - b.y || a.x - b.x).slice(0, 20);
+function edgePixels(bitmap: ImageBitmap, width: number, height: number, enabled: boolean) {
+  if (!enabled) return;
+  canvas.width = width; canvas.height = height;
+  context.drawImage(bitmap, 0, 0, width, height);
+  return context.getImageData(0, 0, width, height).data;
 }
 
-async function recognize(bitmap: ImageBitmap, minConfidence: number) {
+async function recognize(bitmap: ImageBitmap, minConfidence: number, ignoreClippedText = false) {
   if (!detector || !recognizer) throw new Error('请先加载模型。');
   // Keep more detail in 1080p outlined subtitles; aggressively downscaling the
   // strip can hide characters drawn over light clothing or hands.
@@ -146,6 +129,7 @@ async function recognize(bitmap: ImageBitmap, minConfidence: number) {
   const input = await inputTensor(w, h, false);
   if (timings) timings.detectorPrepareMs = performance.now() - started;
   let boxes: Region[];
+  let ignoredTextBoxes = 0;
   let out: ort.InferenceSession.OnnxValueMapType = {};
   try {
     const runStarted = profiling ? performance.now() : 0;
@@ -160,8 +144,7 @@ async function recognize(bitmap: ImageBitmap, minConfidence: number) {
     const probabilities = profiling ? await value.getData() as Float32Array : value.data as Float32Array;
     if (timings) { timings.detectorOutputMs = performance.now() - outputStarted; timings.outputBytes += probabilities.byteLength; }
     const postStarted = profiling ? performance.now() : 0;
-    boxes = mergeTextBoxes(findBoxes(probabilities, mapWidth, mapHeight).map(b => ({ x: b.x * bitmap.width, y: b.y * bitmap.height, width: b.width * bitmap.width, height: b.height * bitmap.height })))
-      .map(b => ({ x: b.x / bitmap.width, y: b.y / bitmap.height, width: b.width / bitmap.width, height: b.height / bitmap.height }));
+    ({ boxes, ignoredTextBoxes } = detectTextBoxes(probabilities, mapWidth, mapHeight, bitmap.width, bitmap.height, ignoreClippedText, edgePixels(bitmap, mapWidth, mapHeight, ignoreClippedText)));
     if (timings) { timings.detectorPostMs = performance.now() - postStarted; timings.boxes = boxes.length; }
   } finally { input.dispose(); Object.values(out).forEach(t => t.dispose()); }
   const lines: OcrLine[] = [];
@@ -207,7 +190,7 @@ async function recognize(bitmap: ImageBitmap, minConfidence: number) {
       if (text && decoded.confidence >= minConfidence) lines.push({ text, confidence: decoded.confidence, box, spacingInferred: text !== filteredText, edgeFiltered: tokens.length !== decoded.tokens.length });
     } finally { tensor.dispose(); Object.values(results).forEach(t => t.dispose()); }
   }
-  return { ...assembleLines(lines), elapsed: performance.now() - started, counts: { detectorCalls: 1, detectorBatch2: 0, recognizerCalls: boxes.length, recognizerBatch2: 0 }, ...(timings ? { timings } : {}) };
+  return { ...assembleLines(lines), ignoredTextBoxes, elapsed: performance.now() - started, counts: { detectorCalls: 1, detectorBatch2: 0, recognizerCalls: boxes.length, recognizerBatch2: 0 }, ...(timings ? { timings } : {}) };
 }
 
 function assembleLines(lines: OcrLine[]) {
@@ -236,7 +219,7 @@ async function joinInputs(inputs: ort.Tensor[], width: number, height: number) {
   } catch (error) { buffer.destroy(); throw error; }
 }
 
-async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, batch = true) {
+async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, batch = true, ignoreClippedText = false) {
   if (!detector || !recognizer) throw new Error('请先加载模型。');
   if (!bitmaps.length || bitmaps.length > OCR_WINDOW_FRAMES) throw new Error('每次最多处理 8 张裁图。');
   const bytes = bitmaps.reduce((sum, bitmap) => sum + bitmap.width * bitmap.height * 4, 0);
@@ -244,6 +227,7 @@ async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, ba
   const started = performance.now();
   const counts: OcrBatchCounts = { detectorCalls: 0, detectorBatch2: 0, recognizerCalls: 0, recognizerBatch2: 0 };
   const timings: OcrTimings | undefined = profiling ? { detectorPrepareMs: 0, detectorRunMs: 0, detectorOutputMs: 0, detectorPostMs: 0, recognizerPrepareMs: 0, recognizerRunMs: 0, recognizerOutputMs: 0, ctcMs: 0, visualPostMs: 0, outputBytes: 0, boxes: 0 } : undefined;
+  const ignoredTextBoxes = bitmaps.map(() => 0);
   const boxes: Region[][] = bitmaps.map(() => []), lines: OcrLine[][] = bitmaps.map(() => []);
 
   // Prepare only the current pair. Recognition jobs store geometry, not tensors
@@ -302,8 +286,8 @@ async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, ba
       const postStarted = performance.now();
       jobs.forEach((job, i) => {
         const bitmap = bitmaps[job.index], value = values[i];
-        boxes[job.index] = mergeTextBoxes(findBoxes(value.probabilities, value.dims[3], value.dims[2]).map(box => ({ x: box.x * bitmap.width, y: box.y * bitmap.height, width: box.width * bitmap.width, height: box.height * bitmap.height })))
-          .map(box => ({ x: box.x / bitmap.width, y: box.y / bitmap.height, width: box.width / bitmap.width, height: box.height / bitmap.height }));
+        const detected = detectTextBoxes(value.probabilities, value.dims[3], value.dims[2], bitmap.width, bitmap.height, ignoreClippedText, edgePixels(bitmap, value.dims[3], value.dims[2], ignoreClippedText));
+        boxes[job.index] = detected.boxes; ignoredTextBoxes[job.index] = detected.ignoredTextBoxes;
         if (timings) timings.boxes += boxes[job.index].length;
       });
       if (timings) timings.detectorPostMs += performance.now() - postStarted;
@@ -340,25 +324,25 @@ async function recognizeWindow(bitmaps: ImageBitmap[], minConfidence: number, ba
       if (text && decoded.confidence >= minConfidence) lines[job.index].push({ text, confidence: decoded.confidence, box: job.box!, spacingInferred: text !== filteredText, edgeFiltered: tokens.length !== decoded.tokens.length });
     });
   }
-  return { values: lines.map(assembleLines), elapsed: performance.now() - started, counts, fallback: !detectorBatch.enabled || !recognizerBatch.enabled, ...(timings ? { timings } : {}) };
+  return { values: lines.map((value, index) => ({ ...assembleLines(value), ignoredTextBoxes: ignoredTextBoxes[index] })), elapsed: performance.now() - started, counts, fallback: !detectorBatch.enabled || !recognizerBatch.enabled, ...(timings ? { timings } : {}) };
 }
 
 const frameReuse = new FrameReuse();
 let signatureReader: FrameSignatureReader | undefined;
 async function recognizeChangedWindow(data: { bitmaps: ImageBitmap[]; minConfidence: number } & OcrWindowOptions): Promise<OcrWindowResult> {
   const { bitmaps, minConfidence } = data;
-  if (!data.deduplicate) return { ...await recognizeWindow(bitmaps, minConfidence, data.batch), reusedFrames: 0, ocrFrames: bitmaps.length };
+  if (!data.deduplicate) return { ...await recognizeWindow(bitmaps, minConfidence, data.batch, data.ignoreClippedText), reusedFrames: 0, ocrFrames: bitmaps.length };
   if (!bitmaps.length || bitmaps.length > OCR_WINDOW_FRAMES || (bitmaps.length > 1 && bitmaps.reduce((sum, bitmap) => sum + bitmap.width * bitmap.height * 4, 0) > OCR_WINDOW_BYTES)) throw new Error('裁图暂存量超过限制。');
   if (!data.scope || !data.times) throw new Error('画面去重需要任务标识和采样时间。');
   const started = performance.now();
   signatureReader ||= new FrameSignatureReader();
   const signatures = bitmaps.map(bitmap => signatureReader!.read(bitmap));
   const signatureMs = performance.now() - started;
-  frameReuse.reset(data.scope);
+  frameReuse.reset(`${data.scope}:clip=${Boolean(data.ignoreClippedText)}:confidence=${minConfidence}`);
   const counts: OcrBatchCounts = { detectorCalls: 0, detectorBatch2: 0, recognizerCalls: 0, recognizerBatch2: 0 };
   let timings: OcrTimings | undefined, fallback = false, ocrFrames = 0;
   const result = await frameReuse.recognize(signatures, data.times, async indices => {
-    const result = await recognizeWindow(indices.map(index => bitmaps[index]), minConfidence, data.batch);
+    const result = await recognizeWindow(indices.map(index => bitmaps[index]), minConfidence, data.batch, data.ignoreClippedText);
     ocrFrames += indices.length; fallback ||= result.fallback;
     for (const key of Object.keys(counts) as (keyof OcrBatchCounts)[]) counts[key] += result.counts[key];
     if (result.timings) {
@@ -376,7 +360,7 @@ self.onmessage = (event: MessageEvent) => {
   const { id, type, data } = event.data;
   tasks = tasks.then(async () => {
     try {
-      const result = type === 'init' ? await init(data) : type === 'window' ? await recognizeChangedWindow(data) : await recognize(data.bitmap, data.minConfidence);
+      const result = type === 'init' ? await init(data) : type === 'window' ? await recognizeChangedWindow(data) : await recognize(data.bitmap, data.minConfidence, data.ignoreClippedText);
       self.postMessage({ id, result });
     } catch (error) { self.postMessage({ id, error: error instanceof Error ? error.message : String(error) }); }
     finally {
