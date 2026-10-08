@@ -1,4 +1,6 @@
 import './style.css';
+import { setupBatch } from './batch-ui';
+import { batchRange, BatchJobError, type BatchSettings } from './batch';
 import { setupPwa } from './pwa';
 import thirdPartyNotices from '../THIRD_PARTY_NOTICES.md?raw';
 import projectLicense from '../LICENSE?raw';
@@ -54,6 +56,7 @@ function rememberRegion() {
   try { localStorage.setItem('sub-extract-region', JSON.stringify(region)); } catch { /* Region editing still works without storage. */ }
   void colorFilterUi.preview();
 }
+let batchUi: ReturnType<typeof setupBatch> | undefined;
 let source: File | undefined;
 let sourceURL: string | undefined;
 let region: Region = readSavedRegion();
@@ -101,7 +104,7 @@ function invalidateFailedEngine() {
 }
 function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
 function refreshControls() {
-  const locked = Boolean(busy);
+  const locked = Boolean(busy) || Boolean(batchUi?.locked);
   colorFilterUi.refresh(locked, Boolean(source));
   for (const id of ['load-online', 'load-local', 'backend', 'detector-file', 'recognizer-file', 'dictionary-file', 'video-file', 'video-file-empty', 'import-json', 'select-region', 'reset-region', 'full-region', 'range-start', 'range-end', 'interval', 'confidence', 'refine', 'batch-ocr', 'deduplicate', 'ignore-clipped-text', 'whole-video', 'clear-cache', 'clear-cues', 'add-cue']) ($<HTMLInputElement>(id)).disabled = locked;
   const onlineButton = $<HTMLButtonElement>('load-online');
@@ -110,7 +113,8 @@ function refreshControls() {
   $('load-local').textContent = busy === 'model' && modelMode === 'local' ? '加载模型中…' : engineReady && modelMode === 'local' ? '重新加载本地模型' : '加载所选文件';
   $<HTMLButtonElement>('extract').disabled = locked || !source || !engineReady;
   $<HTMLButtonElement>('test-frame').disabled = locked || !source || !engineReady;
-  $('cancel').hidden = !locked; $('extract').hidden = locked;
+  $('cancel').hidden = !busy || Boolean(batchUi?.running); $('extract').hidden = locked || Boolean(batchUi?.enabled);
+  $<HTMLInputElement>('import-json').disabled ||= Boolean(batchUi?.enabled);
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-export]')) button.disabled = locked || !project?.cues.length;
   for (const input of cueList.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLButtonElement>('input, textarea, button')) input.disabled = locked;
   $('crop-layer').classList.toggle('selecting', cropMode && !locked);
@@ -118,6 +122,7 @@ function refreshControls() {
   $('crop-box').setAttribute('aria-disabled', String(locked));
   $('crop-box').title = locked ? '识别中，字幕区域已固定' : '拖动移动 · 角点缩放 · Ctrl / ⌘ 拖动对称缩放 · 靠近中心吸附 · 方向键微调（Shift 加速）';
   for (const handle of document.querySelectorAll<HTMLButtonElement>('.crop-handle')) handle.disabled = locked || !source;
+  batchUi?.refresh();
 }
 function updateRegion() {
   const box = $('crop-box'); box.style.left = `${region.x * 100}%`; box.style.top = `${region.y * 100}%`; box.style.width = `${region.width * 100}%`; box.style.height = `${region.height * 100}%`;
@@ -127,26 +132,40 @@ function updateRegion() {
 }
 function setCropMode(value: boolean) { cropMode = value; $('select-region').classList.toggle('selected', value); refreshControls(); }
 
-async function loadVideo(file: File) {
-  if (busy) return;
-  if (project?.cues.length && source && !confirm('更换视频将清空当前时间轴。请先导出 JSON 保存结果。继续更换？')) return;
-  if (source) { project = undefined; observations = []; }
-  previewSeek?.abort();
-  pendingSeek = Promise.resolve();
+function releaseVideo() {
+  previewSeek?.abort(); pendingSeek = Promise.resolve(); video.pause();
+  video.removeAttribute('src'); video.load();
   if (sourceURL) URL.revokeObjectURL(sourceURL);
-  colorFilterUi.sourceChanged();
-  source = file; metadata = undefined; sourceURL = URL.createObjectURL(file); $('frame-result').hidden = true;
-  video.src = sourceURL; $('video-empty').hidden = true; stage.classList.add('has-video');
+  sourceURL = undefined; source = undefined; metadata = undefined; project = undefined; observations = [];
+  colorFilterUi.sourceChanged(); $('video-empty').hidden = false; stage.classList.remove('has-video');
+  $('transport').hidden = true; $('frame-result').hidden = true;
+  stage.style.removeProperty('aspect-ratio');
+  $('video-name').textContent = '尚未选择视频'; $('video-info').textContent = '—';
+  updateRegion(); renderCues();
+}
+async function loadVideo(file: File, internal?: { signal?: AbortSignal; restoreProject?: Project }) {
+  if (busy) { if (internal) throw new Error('当前任务尚未结束。'); return; }
+  if (!internal && project?.cues.length && source && !confirm('更换视频将清空当前时间轴。请先导出 JSON 保存结果。继续更换？')) return;
+  // A JSON imported before its video is selected should remain attached.
+  const imported = !internal && !source ? project : internal?.restoreProject;
+  releaseVideo(); project = imported;
+  source = file; sourceURL = URL.createObjectURL(file); $('video-empty').hidden = true; stage.classList.add('has-video');
   $('video-name').textContent = file.name; $('video-info').textContent = '读取视频…';
   $<HTMLInputElement>('range-start').value = formatTime(0);
   try {
     await new Promise<void>((resolve, reject) => {
+      const signal = internal?.signal;
       const loaded = () => { cleanup(); resolve(); };
       const failed = () => { cleanup(); reject(new Error('浏览器无法播放该视频，请使用 H.264 MP4。')); };
-      const cleanup = () => { video.removeEventListener('loadedmetadata', loaded); video.removeEventListener('error', failed); };
-      video.addEventListener('loadedmetadata', loaded, { once: true }); video.addEventListener('error', failed, { once: true });
+      const aborted = () => { cleanup(); reject(signal?.reason || new DOMException('已停止', 'AbortError')); };
+      const timer = setTimeout(() => { cleanup(); reject(new Error('视频信息读取超时，请检查文件与浏览器编码支持。')); }, 10000);
+      const cleanup = () => { clearTimeout(timer); video.removeEventListener('loadedmetadata', loaded); video.removeEventListener('error', failed); signal?.removeEventListener('abort', aborted); };
+      video.addEventListener('loadedmetadata', loaded, { once: true }); video.addEventListener('error', failed, { once: true }); signal?.addEventListener('abort', aborted, { once: true });
+      if (signal?.aborted) { aborted(); return; }
+      video.src = sourceURL!;
     });
     if (source !== file) return;
+    if (!Number.isFinite(video.duration) || video.duration <= 0) throw new Error('视频时长无效。');
     stage.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
     $('transport').hidden = false; $<HTMLInputElement>('video-scrub').max = String(video.duration); updateTransport();
     $<HTMLInputElement>('range-end').value = formatTime(video.duration * 1000);
@@ -154,9 +173,14 @@ async function loadVideo(file: File) {
     if (project && Math.abs(project.source.duration - video.duration * 1000) > 1000) toast('导入项目与当前视频的时长不一致，请检查时间轴。', true);
     $('run-status').textContent = engineReady ? '已就绪，可以开始提取。' : '视频已载入，请加载识别模型。';
     updateRegion(); renderCues(); refreshControls();
-  } catch (error) { if (source !== file) return; toast(message(error), true); source = undefined; $('video-empty').hidden = false; stage.classList.remove('has-video'); $('transport').hidden = true; refreshControls(); }
+  } catch (error) {
+    if (source !== file) return;
+    releaseVideo(); project = imported; renderCues(); refreshControls();
+    if (internal) throw error;
+    toast(message(error), true);
+  }
 }
-for (const id of ['video-file', 'video-file-empty']) $<HTMLInputElement>(id).addEventListener('change', e => { const file = (e.target as HTMLInputElement).files?.[0]; if (file) void loadVideo(file); });
+for (const id of ['video-file', 'video-file-empty']) $<HTMLInputElement>(id).addEventListener('change', e => { const file = (e.target as HTMLInputElement).files?.[0]; if (file && !batchUi?.enabled && !batchUi?.locked) void loadVideo(file); });
 
 const dropHint = document.createElement('div');
 dropHint.className = 'video-drop-hint'; dropHint.hidden = true; dropHint.setAttribute('role', 'status');
@@ -166,9 +190,9 @@ const isFileDrag = (event: DragEvent) => event.dataTransfer?.types.includes('Fil
 function clearFileDrag() { fileDragDepth = 0; stage.classList.remove('file-drag-over'); dropHint.hidden = true; }
 function showFileDrag(event: DragEvent) {
   event.preventDefault();
-  if (event.dataTransfer) event.dataTransfer.dropEffect = busy ? 'none' : 'copy';
+  if (event.dataTransfer) event.dataTransfer.dropEffect = busy || batchUi?.locked ? 'none' : 'copy';
   stage.classList.add('file-drag-over'); dropHint.hidden = false;
-  dropHint.textContent = busy ? '任务进行中，请结束后再拖入视频' : source ? '松开以更换视频' : '松开以打开视频';
+  dropHint.textContent = batchUi?.enabled ? '松开以添加到剧集队列' : busy ? '任务进行中，请结束后再拖入视频' : source ? '松开以更换视频' : '松开以打开视频';
 }
 stage.addEventListener('dragenter', event => { if (isFileDrag(event)) { fileDragDepth++; showFileDrag(event); } });
 stage.addEventListener('dragover', event => { if (isFileDrag(event)) showFileDrag(event); });
@@ -176,7 +200,8 @@ stage.addEventListener('dragleave', () => { if (--fileDragDepth <= 0) clearFileD
 stage.addEventListener('drop', event => {
   if (!isFileDrag(event)) return;
   event.preventDefault(); clearFileDrag();
-  if (busy) return toast('任务进行中，请结束后再拖入视频。');
+  if (batchUi?.enabled && event.dataTransfer) { void batchUi.drop(event.dataTransfer); return; }
+  if (busy || batchUi?.locked) return toast('任务进行中，请结束后再拖入视频。');
   const files = event.dataTransfer?.files;
   if (!files?.length) return toast('请拖入一个本地视频文件。', true);
   if (files.length !== 1) return toast('请一次拖入一个视频文件。', true);
@@ -188,7 +213,7 @@ stage.addEventListener('drop', event => {
 document.addEventListener('dragover', event => {
   if (!isFileDrag(event)) return;
   event.preventDefault();
-  if (!stage.contains(event.target as Node) && event.dataTransfer) event.dataTransfer.dropEffect = 'none';
+  if (!stage.contains(event.target as Node) && !document.getElementById('batch-panel')?.contains(event.target as Node) && event.dataTransfer) event.dataTransfer.dropEffect = 'none';
 });
 document.addEventListener('drop', event => { if (isFileDrag(event)) { event.preventDefault(); clearFileDrag(); } });
 window.addEventListener('dragend', clearFileDrag);
@@ -205,7 +230,7 @@ function guides(x = false, y = false) {
   $('crop-box').classList.toggle('snapped', x || y);
 }
 $('crop-layer').onpointerdown = event => {
-  if (!source || busy) return;
+  if (!source || busy || batchUi?.locked) return;
   const target = event.target as HTMLElement, corner = target.closest<HTMLElement>('.crop-handle')?.dataset.corner as CropCorner | undefined;
   const mode = cropPointerMode(event, cropMode, corner); if (!mode) return;
   if (!cropMode && !target.closest('#crop-box')) return;
@@ -253,7 +278,7 @@ $('crop-layer').oncontextmenu = event => { if (event.ctrlKey || event.metaKey ||
 $('crop-layer').onpointercancel = cancelDrag;
 $('crop-layer').onlostpointercapture = () => { if (drag) cancelDrag(); };
 $('crop-box').onkeydown = event => {
-  if (!source || busy || event.ctrlKey || event.metaKey) return;
+  if (!source || busy || batchUi?.locked || event.ctrlKey || event.metaKey) return;
   if (event.key === 'Escape') { cancelDrag(); setCropMode(false); return; }
   const direction: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
   if (!direction[event.key]) return;
@@ -337,14 +362,19 @@ $('ignore-clipped-text').onchange = () => {
 $('batch-ocr').onchange = () => { try { localStorage.setItem('sub-extract-batch', String($<HTMLInputElement>('batch-ocr').checked)); } catch { /* Use current selection without storage. */ } };
 $('whole-video').onclick = () => { $<HTMLInputElement>('range-start').value = formatTime(0); $<HTMLInputElement>('range-end').value = formatTime(video.duration * 1000 || 0); };
 
-async function extract() {
-  if (!source || !engineReady || !engine) return;
+async function extract(job?: { signal: AbortSignal; progress: (value: number, detail: string) => void }): Promise<Project | undefined> {
+  const invalid = (text: string) => { if (job) throw new Error(text); toast(text, true); };
+  if (!source || !engineReady || !engine) { invalid('请选择视频并加载模型。'); return; }
+  if (job?.signal.aborted) throw job.signal.reason;
+
   const start = parseTime($<HTMLInputElement>('range-start').value), end = parseTime($<HTMLInputElement>('range-end').value), interval = Number($<HTMLSelectElement>('interval').value);
-  if (start === null || end === null || start < 0 || end <= start || end > video.duration * 1000 + 1) return toast('请输入有效的起止时间，结束时间不能超过视频时长。', true);
-  let confidence: number; try { confidence = minConfidence(); } catch (e) { return toast(message(e), true); }
-  if (project?.cues.length && !confirm('重新提取将替换当前时间轴。请先导出 JSON 保存修改。继续？')) return;
+  if (start === null || end === null || start < 0 || end <= start || end > video.duration * 1000 + 1) { invalid('请输入有效的起止时间，结束时间不能超过视频时长。'); return; }
+  let confidence: number; try { confidence = minConfidence(); } catch (e) { invalid(message(e)); return; }
+  if (!job && project?.cues.length && !confirm('重新提取将替换当前时间轴。请先导出 JSON 保存修改。继续？')) return;
   busy = 'scan'; active = new AbortController(); const signal = active.signal; video.pause(); setCropMode(false); observations = [];
   project = { schemaVersion: 1, timeUnit: 'ms', source: { name: source.name, duration: Math.round(video.duration * 1000), width: video.videoWidth, height: video.videoHeight }, extraction: { region: { ...region }, start, end, sampleInterval: interval, backend: engineBackend, model: engineModel, complete: false }, cues: [] };
+  const scanController = active, abortJob = () => scanController.abort(job?.signal.reason);
+  job?.signal.addEventListener('abort', abortJob, { once: true });
   const started = performance.now(); let lastRender = 0, refineCount = 0, coarseCount = 0, coarseComplete = false;
   const batchEnabled = engineBackend === 'webgpu' && $<HTMLInputElement>('batch-ocr').checked;
   const deduplicate = $<HTMLInputElement>('deduplicate').checked, scanId = ++scanCounter;
@@ -438,6 +468,7 @@ async function extract() {
   const displayProgress = (time: number, phase: string, value: number) => {
     $<HTMLProgressElement>('progress').value = value;
     $('run-status').textContent = `${phase} · ${formatTime(time)}`;
+    job?.progress(value, `${phase} · ${formatTime(time)}`);
     $('run-detail').textContent = `${coarseCount} 个采样帧${refineCount ? ' + ' + refineCount + ' 个边界帧' : ''} · 已用 ${((performance.now() - started) / 1000).toFixed(1)} 秒 · ${engineBackend.toUpperCase()} · ${modeLabel()}${deduplicate || colorFilter ? ` · OCR ${ocrFrames} 帧 / 复用 ${reusedFrames} 帧` : ''}${filterLabel()}`;
   };
   renderCues(); refreshControls();
@@ -455,7 +486,7 @@ async function extract() {
       if (performance.now() - lastRender > 1000) {
         const renderStarted = metrics ? performance.now() : 0;
         project!.cues = buildCues(observations, start, Math.min(end, time + interval / 2), interval);
-        renderCues(); lastRender = performance.now();
+        if (!job) renderCues(); lastRender = performance.now();
         if (metrics) metrics.add('renderMs', lastRender - renderStarted);
       }
     });
@@ -496,9 +527,12 @@ async function extract() {
     project.extraction.end = processedEnd; project.cues = buildCues(observations, start, processedEnd, interval);
     $('run-status').textContent = signal.aborted ? `已停止 · 保留 ${project.cues.length} 条字幕` : '提取失败，已保留已识别结果。';
     $('run-detail').textContent = signal.aborted ? '可复核并导出已有结果。重新开始会替换时间轴。' : message(error);
-    if (!signal.aborted) toast(message(error), true);
+    if (!signal.aborted && !job) toast(message(error), true);
+    if (job) throw new BatchJobError(message(error), project);
   } finally {
-    busy = undefined; active = undefined; renderCues(); refreshControls();
+    job?.signal.removeEventListener('abort', abortJob);
+    if (job) { metadata = undefined; observations = []; }
+    busy = undefined; active = undefined; if (!job) renderCues(); refreshControls();
     if (metrics) {
       metrics.add('totalMs', performance.now() - started);
       const report = { backend: engineBackend, batchEnabled, batchFallback, deduplicate, reusedFrames, ocrFrames, colorFilter, skippedFrames, colorMismatch, ignoreClippedText, ignoredTextBoxes, complete: project.extraction.complete, ...metrics.snapshot(), notes: 'Sampling wall/consumer/queue times overlap. WebGPU Run measures dispatch; Output includes waiting for GPU completion and download. Profiling changes output scheduling. No pure GPU kernel or transfer duration is claimed.' };
@@ -508,6 +542,7 @@ async function extract() {
       console.info('Sub Extract performance', report);
     }
   }
+  return project;
 }
 $('extract').onclick = () => void extract();
 $('cancel').onclick = () => {
@@ -546,6 +581,13 @@ cueList.addEventListener('click', event => {
   const cue = project?.cues.find(c => c.id === row?.dataset.id); if (!cue) return;
   if (target.closest('.cue-seek')) { if (source) seekCue(cue); else toast('请选择项目对应的视频以预览。'); }
   if (target.closest('.delete-cue')) { project!.cues = project!.cues.filter(c => c !== cue); renderCues(); }
+});
+cueList.addEventListener('input', event => {
+  if (busy || batchUi?.locked) return;
+  const input = event.target as HTMLTextAreaElement;
+  if (!input.matches('.cue-text')) return;
+  const cue = project?.cues.find(c => c.id === input.closest<HTMLElement>('.cue')?.dataset.id);
+  if (cue) { cue.text = input.value; cue.lines = cue.text.split('\n'); }
 });
 cueList.addEventListener('change', event => {
   if (busy) return; const input = event.target as HTMLInputElement, row = input.closest<HTMLElement>('.cue');
@@ -620,11 +662,61 @@ $('add-cue').onclick = () => {
 $('help').onclick = () => $<HTMLDialogElement>('help-dialog').showModal();
 $('close-help').onclick = () => $<HTMLDialogElement>('help-dialog').close();
 $('help-dialog').onclick = event => { if (event.target === $('help-dialog')) $<HTMLDialogElement>('help-dialog').close(); };
-window.addEventListener('beforeunload', event => { if (busy || project?.cues.length) { event.preventDefault(); } });
+window.addEventListener('beforeunload', event => { if (busy || batchUi?.locked || batchUi?.hasResults || project?.cues.length || singleSnapshot?.project?.cues.length) { event.preventDefault(); } });
 try { const saved = localStorage.getItem('sub-extract-deduplicate'); if (saved !== null) $<HTMLInputElement>('deduplicate').checked = saved !== 'false'; } catch { /* Use frame deduplication by default. */ }
 try { const batch = localStorage.getItem('sub-extract-batch'); if (batch !== null) $<HTMLInputElement>('batch-ocr').checked = batch !== 'false'; } catch { /* Use batch acceleration by default. */ }
 try { const preferred = localStorage.getItem('sub-extract-backend'); if (preferred && ['auto', 'webgpu', 'wasm'].includes(preferred)) $<HTMLSelectElement>('backend').value = preferred; } catch { /* Use the default backend. */ }
 try { $<HTMLInputElement>('ignore-clipped-text').checked = localStorage.getItem('sub-extract-ignore-clipped-text') === 'true'; } catch { /* Filtering is opt-in. */ }
+function captureBatchSettings(): BatchSettings {
+  return { region: { ...region }, interval: Number($<HTMLSelectElement>('interval').value), confidence: minConfidence(),
+    batch: $<HTMLInputElement>('batch-ocr').checked, deduplicate: $<HTMLInputElement>('deduplicate').checked,
+    refine: $<HTMLInputElement>('refine').checked, ignoreClippedText: $<HTMLInputElement>('ignore-clipped-text').checked,
+    colorFilter: colorFilterUi.options(), startOffset: 0, endTrim: 0 };
+}
+function applyBatchSettings(settings: BatchSettings) {
+  region = { ...settings.region }; updateRegion();
+  $<HTMLSelectElement>('interval').value = String(settings.interval); $<HTMLInputElement>('confidence').value = String(settings.confidence);
+  for (const [id, value] of [['batch-ocr', settings.batch], ['deduplicate', settings.deduplicate], ['refine', settings.refine], ['ignore-clipped-text', settings.ignoreClippedText]] as const) $<HTMLInputElement>(id).checked = value;
+  colorFilterUi.apply(settings.colorFilter);
+}
+let singleSnapshot: { file?: File; project?: Project; settings: BatchSettings; start: string; end: string; time: number } | undefined;
+batchUi = setupBatch({
+  capture: captureBatchSettings, apply: applyBatchSettings,
+  async mode(enabled) {
+    if (enabled) {
+      singleSnapshot = { file: source, project, settings: captureBatchSettings(), start: $<HTMLInputElement>('range-start').value, end: $<HTMLInputElement>('range-end').value, time: video.currentTime };
+      releaseVideo();
+    } else {
+      releaseVideo(); const saved = singleSnapshot;
+      if (saved) {
+        if (saved.file) { try { await loadVideo(saved.file, { restoreProject: saved.project }); } catch (error) { project = saved.project; toast(message(error), true); } } else project = saved.project;
+        applyBatchSettings(saved.settings); $<HTMLInputElement>('range-start').value = saved.start; $<HTMLInputElement>('range-end').value = saved.end;
+        if (source) seekTo(saved.time * 1000);
+        renderCues();
+      }
+      singleSnapshot = undefined;
+    }
+  },
+  async open(item, settings, signal) {
+    cancelDrag(); setCropMode(false); video.pause();
+    if (source !== item.file) await loadVideo(item.file, { signal, restoreProject: item.result });
+    project = item.result; observations = []; currentCueId = '';
+    applyBatchSettings(settings);
+    // Range validation happens on execution, so a short calibration clip can
+    // still be previewed with the full episode's intro/ending settings.
+    $<HTMLInputElement>('range-start').value = formatTime(settings.startOffset);
+    $<HTMLInputElement>('range-end').value = formatTime(Math.max(0, video.duration * 1000 - settings.endTrim));
+    renderCues();
+  },
+  async execute(signal, progress) {
+    const range = batchRange(Math.round(video.duration * 1000), { startOffset: parseTime($<HTMLInputElement>('range-start').value) ?? NaN, endTrim: Math.round(video.duration * 1000) - (parseTime($<HTMLInputElement>('range-end').value) ?? NaN) });
+    $<HTMLInputElement>('range-start').value = formatTime(range.start); $<HTMLInputElement>('range-end').value = formatTime(range.end);
+    const result = await extract({ signal, progress });
+    if (!result) throw new Error('未能启动提取。');
+    return result;
+  },
+  release: releaseVideo, ready: () => engineReady, busy: () => Boolean(busy), refresh: refreshControls, toast,
+});
 setupPwa(toast);
 updateRegion(); refreshControls();
 void getModelCacheState().then(state => {

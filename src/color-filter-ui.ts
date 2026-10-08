@@ -10,7 +10,7 @@ export function setupColorFilter(video: HTMLVideoElement, stage: HTMLElement, re
 <div class="color-filter-controls"><label>字幕颜色<input id="subtitle-color" type="color" value="#ffffff"></label><button id="pick-subtitle-color" class="secondary">从画面取色</button><button id="white-subtitle" class="quiet">白色字幕</button><label>颜色容差 <output id="color-tolerance-value">60</output><input id="color-tolerance" type="range" min="0" max="128" step="1" value="60"></label></div>
 <div class="color-filter-options"><label class="check"><input id="color-outline" type="checkbox">只保留带深色描边的像素</label><button id="refresh-color-preview" class="quiet">刷新滤镜预览</button></div>
 <canvas id="color-mask-preview" aria-label="字幕颜色过滤预览" hidden></canvas><p id="color-filter-status" class="hint" role="status">选择视频后，可预览字幕区域的颜色匹配效果。</p>
-<p class="hint">预览中白色为保留像素。仅用于判断空帧，OCR 使用原画面。字色变化或淡入淡出可能漏字幕；边界精修不使用此过滤。换视频后需重新启用。</p></div>`;
+<p class="hint">预览中白色为保留像素。仅用于判断空帧，OCR 使用原画面。字色变化或淡入淡出可能漏字幕；边界精修不使用此过滤。单视频换片后需重新启用；批量按设置应用。</p></div>`;
   const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
   const enabled = $<HTMLInputElement>('color-filter-enabled'), color = $<HTMLInputElement>('subtitle-color');
   const tolerance = $<HTMLInputElement>('color-tolerance'), outline = $<HTMLInputElement>('color-outline');
@@ -124,6 +124,12 @@ export function setupColorFilter(video: HTMLVideoElement, stage: HTMLElement, re
   };
   return {
     options: () => enabled.checked ? options() : undefined,
+    apply(value?: ColorFilterOptions) {
+      enabled.checked = Boolean(value);
+      if (value) { color.value = value.color; tolerance.value = String(value.tolerance); outline.checked = value.outline; }
+      $('color-tolerance-value').textContent = tolerance.value;
+      void renderPreview();
+    },
     stopPicking,
     preview: renderPreview,
     sourceChanged() {
